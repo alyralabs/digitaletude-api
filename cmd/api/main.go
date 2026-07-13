@@ -18,6 +18,7 @@ import (
 	"github.com/alyralabs/digitaletude-api/internal/httpserver"
 	"github.com/alyralabs/digitaletude-api/internal/music"
 	"github.com/alyralabs/digitaletude-api/internal/photos"
+	"github.com/alyralabs/digitaletude-api/internal/posts"
 	"github.com/alyralabs/digitaletude-api/internal/storage"
 )
 
@@ -70,6 +71,7 @@ func run() error {
 
 	photos.NewHandler(photos.NewRepo(pool), st).Register(mux, verifier.Middleware)
 	music.NewHandler(music.NewRepo(pool), st).Register(mux, verifier.Middleware)
+	posts.NewHandler(posts.NewRepo(pool), st).Register(mux, verifier.Middleware)
 
 	handler := httpserver.Recover(httpserver.Log(httpserver.CORS(cfg.AllowedOrigin)(mux)))
 	srv := &http.Server{
