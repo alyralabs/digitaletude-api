@@ -5,7 +5,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/alyralabs/digitaletude-api/internal/db"
 )
 
 const Bucket = "photography"
@@ -28,11 +29,11 @@ type Photo struct {
 }
 
 type Repo struct {
-	pool *pgxpool.Pool
+	db db.Querier
 }
 
-func NewRepo(pool *pgxpool.Pool) *Repo {
-	return &Repo{pool: pool}
+func NewRepo(q db.Querier) *Repo {
+	return &Repo{db: q}
 }
 
 const photoCols = "id, title, description, storage_path, thumbnail_path, width, height, sort_order, created_at"
@@ -48,7 +49,7 @@ func scanPhoto(row pgx.Row) (*Photo, error) {
 }
 
 func (r *Repo) List(ctx context.Context) ([]*Photo, error) {
-	rows, err := r.pool.Query(ctx,
+	rows, err := r.db.Query(ctx,
 		"select "+photoCols+" from photos order by sort_order, created_at desc")
 	if err != nil {
 		return nil, err
@@ -67,12 +68,12 @@ func (r *Repo) List(ctx context.Context) ([]*Photo, error) {
 }
 
 func (r *Repo) Get(ctx context.Context, id string) (*Photo, error) {
-	return scanPhoto(r.pool.QueryRow(ctx,
+	return scanPhoto(r.db.QueryRow(ctx,
 		"select "+photoCols+" from photos where id = $1", id))
 }
 
 func (r *Repo) Insert(ctx context.Context, p *Photo) (*Photo, error) {
-	return scanPhoto(r.pool.QueryRow(ctx,
+	return scanPhoto(r.db.QueryRow(ctx,
 		`insert into photos (title, description, storage_path, thumbnail_path, width, height)
 		 values ($1, $2, $3, $4, $5, $6)
 		 returning `+photoCols,
@@ -86,7 +87,7 @@ type PhotoUpdate struct {
 }
 
 func (r *Repo) Update(ctx context.Context, id string, u PhotoUpdate) (*Photo, error) {
-	return scanPhoto(r.pool.QueryRow(ctx,
+	return scanPhoto(r.db.QueryRow(ctx,
 		`update photos set
 		   title = coalesce($2, title),
 		   description = coalesce($3, description),
@@ -100,7 +101,7 @@ func (r *Repo) Update(ctx context.Context, id string, u PhotoUpdate) (*Photo, er
 // cleanup. Row first, storage after: a failed storage cleanup leaves only
 // invisible orphaned files instead of a site serving broken images.
 func (r *Repo) Delete(ctx context.Context, id string) (storagePath, thumbnailPath string, err error) {
-	err = r.pool.QueryRow(ctx,
+	err = r.db.QueryRow(ctx,
 		"delete from photos where id = $1 returning storage_path, thumbnail_path", id).
 		Scan(&storagePath, &thumbnailPath)
 	return storagePath, thumbnailPath, err
