@@ -6,6 +6,9 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -49,6 +52,45 @@ func newTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
 		"sub":  testAdminID,
 		"exp":  time.Now().Add(time.Hour).Unix(),
 		"iat":  time.Now().Unix(),
+	}
+	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mux = http.NewServeMux()
+	NewHandler(repo, st).Register(mux, verifier.Middleware)
+	return mux, token
+}
+
+// newFailingStorageTestServer is a variant of newTestServer whose mock
+// storage backend fails DELETE requests only — uploads still succeed, so a
+// test can create a post (with a cover) normally and then exercise what
+// happens when storage cleanup of the old cover fails on replace, without
+// the setup step itself failing.
+func newFailingStorageTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
+	t.Helper()
+	repo := NewRepo(testutil.OpenTestTx(t))
+
+	storageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(storageSrv.Close)
+	st := storage.New(storageSrv.URL, "test-secret")
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kf := func(*jwt.Token) (any, error) { return &priv.PublicKey, nil }
+	verifier := auth.NewVerifierWithKeyfunc(kf, testAdminID)
+	claims := jwt.MapClaims{
+		"aud": "authenticated", "role": "authenticated", "sub": testAdminID,
+		"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(),
 	}
 	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(priv)
 	if err != nil {
@@ -409,5 +451,174 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 	mux.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusNotFound {
 		t.Errorf("DELETE unknown id status = %d, want 404", delRec.Code)
+	}
+}
+
+func testJPEG(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 100, 80))
+	for y := 0; y < 80; y++ {
+		for x := 0; x < 100; x++ {
+			img.Set(x, y, color.NRGBA{R: 10, G: 20, B: 30, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatalf("encoding test JPEG: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func multipartCoverBody(t *testing.T, fileBytes []byte) (*bytes.Buffer, string) {
+	t.Helper()
+	buf := new(bytes.Buffer)
+	w := multipart.NewWriter(buf)
+	fw, err := w.CreateFormFile("cover", "cover.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(fileBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf, w.FormDataContentType()
+}
+
+func TestHandler_UpdateCover_AddsCoverToPostThatHadNone(t *testing.T) {
+	mux, token := newTestServer(t)
+	created := createTestPost(t, mux, token, map[string]string{
+		"title":           "No Cover Yet",
+		"contentMarkdown": "body",
+	})
+	if created.CoverURL != nil {
+		t.Fatalf("setup: expected no cover, got %v", created.CoverURL)
+	}
+
+	body, contentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+created.ID+"/cover", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	var updated Post
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if updated.CoverURL == nil || *updated.CoverURL == "" {
+		t.Error("expected a cover URL after uploading a cover, got none")
+	}
+}
+
+func TestHandler_UpdateCover_ReplacesExistingCoverAndCleansUpOld(t *testing.T) {
+	mux, token := newFailingStorageTestServer(t)
+
+	// Build the create request directly so it includes a real cover file
+	// (createTestPost/multipartPostBody only handle text fields).
+	buf := new(bytes.Buffer)
+	w := multipart.NewWriter(buf)
+	_ = w.WriteField("title", "Has A Cover")
+	_ = w.WriteField("contentMarkdown", "body")
+	fw, err := w.CreateFormFile("cover", "cover.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(testJPEG(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/posts", buf)
+	createReq.Header.Set("Content-Type", w.FormDataContentType())
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("setup: create with cover status = %d, want 201, body: %s", createRec.Code, createRec.Body.String())
+	}
+	var withCover Post
+	if err := json.Unmarshal(createRec.Body.Bytes(), &withCover); err != nil {
+		t.Fatalf("decoding create response: %v", err)
+	}
+	if withCover.CoverURL == nil {
+		t.Fatal("setup: expected the created post to have a cover")
+	}
+	firstCoverURL := *withCover.CoverURL
+
+	body, contentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+withCover.ID+"/cover", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	// newFailingStorageTestServer fails DELETE only — the replace must still
+	// succeed (204/200) even though best-effort cleanup of the old cover
+	// fails, same posture as delete-with-failed-cleanup elsewhere.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	var updated Post
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if updated.CoverURL == nil || *updated.CoverURL == firstCoverURL {
+		t.Errorf("CoverURL = %v, want a new URL different from the original %q", updated.CoverURL, firstCoverURL)
+	}
+}
+
+func TestHandler_UpdateCover_RejectsNonImage(t *testing.T) {
+	mux, token := newTestServer(t)
+	created := createTestPost(t, mux, token, map[string]string{
+		"title":           "Bad Cover Target",
+		"contentMarkdown": "body",
+	})
+
+	body, contentType := multipartCoverBody(t, []byte("not an image"))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+created.ID+"/cover", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("status = %d, want 415", rec.Code)
+	}
+}
+
+func TestHandler_UpdateCover_UnknownIDReturns404(t *testing.T) {
+	mux, token := newTestServer(t)
+	unknownID := "00000000-0000-0000-0000-000000000000"
+
+	body, contentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+unknownID+"/cover", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestHandler_UpdateCover_RequiresAuth(t *testing.T) {
+	mux, _ := newTestServer(t)
+	unknownID := "00000000-0000-0000-0000-000000000000"
+
+	body, contentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+unknownID+"/cover", body)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
 	}
 }

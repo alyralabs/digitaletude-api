@@ -42,6 +42,7 @@ func (h *Handler) Register(mux *http.ServeMux, adminWrap func(http.Handler) http
 	mux.Handle("GET /api/admin/posts/{id}", adminWrap(http.HandlerFunc(h.get)))
 	mux.Handle("POST /api/admin/posts", adminWrap(http.HandlerFunc(h.create)))
 	mux.Handle("PUT /api/admin/posts/{id}", adminWrap(http.HandlerFunc(h.update)))
+	mux.Handle("PATCH /api/admin/posts/{id}/cover", adminWrap(http.HandlerFunc(h.updateCover)))
 	mux.Handle("PATCH /api/admin/posts/{id}/publish", adminWrap(http.HandlerFunc(h.publish)))
 	mux.Handle("PATCH /api/admin/posts/{id}/unpublish", adminWrap(http.HandlerFunc(h.unpublish)))
 	mux.Handle("DELETE /api/admin/posts/{id}", adminWrap(http.HandlerFunc(h.delete)))
@@ -190,6 +191,64 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpserver.JSON(w, http.StatusOK, h.withCoverURL(p))
+}
+
+// updateCover replaces a post's cover image — add one where there wasn't
+// one, or swap an existing one. Mirrors create's cover-processing branch;
+// a new upload is cleaned up if the row update then fails so it's never
+// left orphaned, and the previous cover (if any) is cleaned up only after
+// the row is confirmed updated to point at the new one.
+func (h *Handler) updateCover(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxPostUploadBytes)
+	if err := r.ParseMultipartForm(4 << 20); err != nil {
+		httpserver.Err(w, http.StatusRequestEntityTooLarge, "too_large", "upload exceeds size limit")
+		return
+	}
+
+	coverFile, _, err := r.FormFile("cover")
+	if err != nil {
+		httpserver.Err(w, http.StatusBadRequest, "bad_request", "missing cover field")
+		return
+	}
+	defer coverFile.Close()
+
+	raw, err := io.ReadAll(coverFile)
+	if err != nil {
+		httpserver.Internal(w, err)
+		return
+	}
+	proc, err := imageproc.Process(raw)
+	if errors.Is(err, imageproc.ErrUnsupportedType) {
+		httpserver.Err(w, http.StatusUnsupportedMediaType, "unsupported_type", "only JPEG and PNG are accepted")
+		return
+	}
+	if err != nil {
+		httpserver.Err(w, http.StatusUnprocessableEntity, "invalid_image", "could not process cover image")
+		return
+	}
+
+	ctx := r.Context()
+	cp := fmt.Sprintf("covers/%s.jpg", uuid.NewString())
+	if err := h.storage.Upload(ctx, Bucket, cp, "image/jpeg", bytes.NewReader(proc.Thumbnail)); err != nil {
+		httpserver.Internal(w, err)
+		return
+	}
+
+	updated, previous, err := h.repo.UpdateCover(ctx, r.PathValue("id"), cp)
+	if errors.Is(err, pgx.ErrNoRows) {
+		h.cleanupObjects(cp)
+		httpserver.Err(w, http.StatusNotFound, "not_found", "post not found")
+		return
+	}
+	if err != nil {
+		h.cleanupObjects(cp)
+		httpserver.Internal(w, err)
+		return
+	}
+	if previous != nil {
+		h.cleanupObjects(*previous)
+	}
+	httpserver.JSON(w, http.StatusOK, h.withCoverURL(updated))
 }
 
 func (h *Handler) publish(w http.ResponseWriter, r *http.Request) {

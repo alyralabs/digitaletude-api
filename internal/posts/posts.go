@@ -200,3 +200,23 @@ func (r *Repo) Delete(ctx context.Context, id string) (coverPath *string, err er
 		"delete from posts where id = $1 returning cover_image_path", id).Scan(&coverPath)
 	return coverPath, err
 }
+
+// UpdateCover replaces a post's cover image path, returning the updated post
+// and the previous cover path (nil if it didn't have one) so the caller can
+// clean up the old object from storage. Two round trips rather than one
+// clever query — this is a low-traffic admin action, not worth the
+// complexity of returning both old and new state from a single statement.
+func (r *Repo) UpdateCover(ctx context.Context, id string, coverPath string) (post *Post, previousCoverPath *string, err error) {
+	var previous *string
+	if err := r.db.QueryRow(ctx,
+		"select cover_image_path from posts where id = $1", id).Scan(&previous); err != nil {
+		return nil, nil, err
+	}
+	updated, err := scanPost(r.db.QueryRow(ctx,
+		"update posts set cover_image_path = $2, updated_at = now() where id = $1 returning "+postCols,
+		id, coverPath))
+	if err != nil {
+		return nil, nil, err
+	}
+	return updated, previous, nil
+}

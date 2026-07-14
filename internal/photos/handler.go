@@ -117,6 +117,18 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A malformed EXIF segment shouldn't fail the upload any more than a
+	// missing one does — proc.Exif is already nil in that case, so this
+	// marshal is only reached with well-formed data and won't itself fail.
+	var exifJSON json.RawMessage
+	if proc.Exif != nil {
+		exifJSON, err = json.Marshal(proc.Exif)
+		if err != nil {
+			httpserver.Internal(w, err)
+			return
+		}
+	}
+
 	photo := &Photo{
 		Title:         r.FormValue("title"),
 		Description:   r.FormValue("description"),
@@ -124,6 +136,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		ThumbnailPath: thumbPath,
 		Width:         proc.Width,
 		Height:        proc.Height,
+		Exif:          exifJSON,
 	}
 	created, err := h.repo.Insert(ctx, photo)
 	if err != nil {

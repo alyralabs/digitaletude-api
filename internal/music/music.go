@@ -201,3 +201,39 @@ func (r *Repo) DeleteTrack(ctx context.Context, id string) (storagePath string, 
 		Scan(&storagePath, &coverPath)
 	return storagePath, coverPath, err
 }
+
+// UpdateAlbumCover replaces an album's cover image path, returning the
+// updated album and the previous cover path (nil if it didn't have one) so
+// the caller can clean up the old object from storage.
+func (r *Repo) UpdateAlbumCover(ctx context.Context, id string, coverPath string) (album *Album, previousCoverPath *string, err error) {
+	var previous *string
+	if err := r.db.QueryRow(ctx,
+		"select cover_image_path from albums where id = $1", id).Scan(&previous); err != nil {
+		return nil, nil, err
+	}
+	updated, err := scanAlbum(r.db.QueryRow(ctx,
+		"update albums set cover_image_path = $2 where id = $1 returning "+albumCols,
+		id, coverPath))
+	if err != nil {
+		return nil, nil, err
+	}
+	return updated, previous, nil
+}
+
+// UpdateTrackCover replaces a track's cover image path, returning the
+// updated track and the previous cover path (nil if it didn't have one) so
+// the caller can clean up the old object from storage.
+func (r *Repo) UpdateTrackCover(ctx context.Context, id string, coverPath string) (track *Track, previousCoverPath *string, err error) {
+	var previous *string
+	if err := r.db.QueryRow(ctx,
+		"select cover_image_path from tracks where id = $1", id).Scan(&previous); err != nil {
+		return nil, nil, err
+	}
+	updated, err := scanTrack(r.db.QueryRow(ctx,
+		"update tracks set cover_image_path = $2 where id = $1 returning "+trackCols,
+		id, coverPath))
+	if err != nil {
+		return nil, nil, err
+	}
+	return updated, previous, nil
+}

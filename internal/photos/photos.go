@@ -2,6 +2,7 @@ package photos
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -12,15 +13,16 @@ import (
 const Bucket = "photography"
 
 type Photo struct {
-	ID            string    `json:"id"`
-	Title         string    `json:"title"`
-	Description   string    `json:"description"`
-	StoragePath   string    `json:"-"`
-	ThumbnailPath string    `json:"-"`
-	Width         int       `json:"width"`
-	Height        int       `json:"height"`
-	SortOrder     int       `json:"sortOrder"`
-	CreatedAt     time.Time `json:"createdAt"`
+	ID            string          `json:"id"`
+	Title         string          `json:"title"`
+	Description   string          `json:"description"`
+	StoragePath   string          `json:"-"`
+	ThumbnailPath string          `json:"-"`
+	Width         int             `json:"width"`
+	Height        int             `json:"height"`
+	SortOrder     int             `json:"sortOrder"`
+	CreatedAt     time.Time       `json:"createdAt"`
+	Exif          json.RawMessage `json:"exif,omitempty"`
 
 	// Full public URLs, composed by the server; the frontend never builds
 	// storage URLs itself.
@@ -36,12 +38,12 @@ func NewRepo(q db.Querier) *Repo {
 	return &Repo{db: q}
 }
 
-const photoCols = "id, title, description, storage_path, thumbnail_path, width, height, sort_order, created_at"
+const photoCols = "id, title, description, storage_path, thumbnail_path, width, height, sort_order, created_at, exif"
 
 func scanPhoto(row pgx.Row) (*Photo, error) {
 	var p Photo
 	err := row.Scan(&p.ID, &p.Title, &p.Description, &p.StoragePath, &p.ThumbnailPath,
-		&p.Width, &p.Height, &p.SortOrder, &p.CreatedAt)
+		&p.Width, &p.Height, &p.SortOrder, &p.CreatedAt, &p.Exif)
 	if err != nil {
 		return nil, err
 	}
@@ -74,10 +76,10 @@ func (r *Repo) Get(ctx context.Context, id string) (*Photo, error) {
 
 func (r *Repo) Insert(ctx context.Context, p *Photo) (*Photo, error) {
 	return scanPhoto(r.db.QueryRow(ctx,
-		`insert into photos (title, description, storage_path, thumbnail_path, width, height)
-		 values ($1, $2, $3, $4, $5, $6)
+		`insert into photos (title, description, storage_path, thumbnail_path, width, height, exif)
+		 values ($1, $2, $3, $4, $5, $6, $7)
 		 returning `+photoCols,
-		p.Title, p.Description, p.StoragePath, p.ThumbnailPath, p.Width, p.Height))
+		p.Title, p.Description, p.StoragePath, p.ThumbnailPath, p.Width, p.Height, p.Exif))
 }
 
 type PhotoUpdate struct {

@@ -10,6 +10,8 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/disintegration/imaging"
 	"github.com/rwcarlsen/goexif/exif"
@@ -29,6 +31,29 @@ type Processed struct {
 	Width     int
 	Height    int
 	Thumbnail []byte // JPEG
+
+	// Exif is nil for PNGs, for JPEGs with no EXIF segment, and for JPEGs
+	// whose EXIF has none of the fields below — never a reason to fail the
+	// upload either way.
+	Exif *Exif
+}
+
+// Exif is the small subset of EXIF metadata shown to visitors as a
+// viewfinder-style overlay — not a full EXIF dump. Every field is optional:
+// cameras vary in what they record, and a missing/malformed tag is simply
+// omitted rather than failing extraction. Fields are pre-formatted strings
+// (not raw numbers) so the frontend just joins them, no per-field
+// formatting logic on that side.
+type Exif struct {
+	Camera       string `json:"camera,omitempty"`
+	Aperture     string `json:"aperture,omitempty"`
+	ShutterSpeed string `json:"shutterSpeed,omitempty"`
+	ISO          string `json:"iso,omitempty"`
+	FocalLength  string `json:"focalLength,omitempty"`
+}
+
+func (e *Exif) isEmpty() bool {
+	return e.Camera == "" && e.Aperture == "" && e.ShutterSpeed == "" && e.ISO == "" && e.FocalLength == ""
 }
 
 // Process validates raw upload bytes and produces the thumbnail.
@@ -65,8 +90,12 @@ func Process(raw []byte) (*Processed, error) {
 		return nil, fmt.Errorf("decoding image: %w", err)
 	}
 
+	var exifData *Exif
 	if mime == "image/jpeg" {
-		img = applyOrientation(img, raw)
+		if x, err := exif.Decode(bytes.NewReader(raw)); err == nil {
+			img = applyOrientation(img, x)
+			exifData = extractExif(x)
+		}
 	}
 
 	// Orientation 5-8 swap the axes, so measure after correcting.
@@ -88,16 +117,13 @@ func Process(raw []byte) (*Processed, error) {
 		Width:     width,
 		Height:    height,
 		Thumbnail: buf.Bytes(),
+		Exif:      exifData,
 	}, nil
 }
 
 // applyOrientation rotates/flips per the EXIF orientation tag. Any failure to
-// read EXIF means "leave the image alone" — never fail an upload over it.
-func applyOrientation(img image.Image, raw []byte) image.Image {
-	x, err := exif.Decode(bytes.NewReader(raw))
-	if err != nil {
-		return img
-	}
+// read the tag means "leave the image alone" — never fail an upload over it.
+func applyOrientation(img image.Image, x *exif.Exif) image.Image {
 	tag, err := x.Get(exif.Orientation)
 	if err != nil {
 		return img
@@ -125,4 +151,99 @@ func applyOrientation(img image.Image, raw []byte) image.Image {
 	default:
 		return img
 	}
+}
+
+// extractExif pulls the camera-settings fields shown in the viewfinder
+// overlay. Each field is independent — one missing/malformed tag doesn't
+// block the others. Returns nil if nothing at all was found, so callers can
+// treat "no EXIF worth showing" as a single nil check.
+func extractExif(x *exif.Exif) *Exif {
+	e := &Exif{}
+
+	cameraMake, _ := stringTag(x, exif.Make)
+	model, _ := stringTag(x, exif.Model)
+	e.Camera = combineCameraName(cameraMake, model)
+
+	if num, den, err := ratTag(x, exif.FNumber); err == nil && den != 0 {
+		e.Aperture = formatAperture(float64(num) / float64(den))
+	}
+	if num, den, err := ratTag(x, exif.ExposureTime); err == nil && den != 0 {
+		e.ShutterSpeed = formatShutterSpeed(num, den)
+	}
+	if tag, err := x.Get(exif.ISOSpeedRatings); err == nil {
+		if iso, err := tag.Int(0); err == nil {
+			e.ISO = fmt.Sprintf("ISO %d", iso)
+		}
+	}
+	if num, den, err := ratTag(x, exif.FocalLength); err == nil && den != 0 {
+		e.FocalLength = formatFocalLength(float64(num) / float64(den))
+	}
+
+	if e.isEmpty() {
+		return nil
+	}
+	return e
+}
+
+func stringTag(x *exif.Exif, name exif.FieldName) (string, error) {
+	tag, err := x.Get(name)
+	if err != nil {
+		return "", err
+	}
+	return tag.StringVal()
+}
+
+func ratTag(x *exif.Exif, name exif.FieldName) (num, den int64, err error) {
+	tag, err := x.Get(name)
+	if err != nil {
+		return 0, 0, err
+	}
+	return tag.Rat2(0)
+}
+
+// combineCameraName joins make + model, deduping the common case where the
+// model already includes the make (e.g. "Canon EOS R5").
+func combineCameraName(cameraMake, model string) string {
+	cameraMake = strings.TrimSpace(cameraMake)
+	model = strings.TrimSpace(model)
+	switch {
+	case model == "":
+		return cameraMake
+	case cameraMake == "" || strings.Contains(strings.ToLower(model), strings.ToLower(cameraMake)):
+		return model
+	default:
+		return cameraMake + " " + model
+	}
+}
+
+func formatAperture(f float64) string {
+	return "f/" + trimTrailingZero(f)
+}
+
+func formatFocalLength(mm float64) string {
+	return trimTrailingZero(mm) + "mm"
+}
+
+// trimTrailingZero formats to one decimal place, then drops a trailing
+// ".0" — f/2.8 stays f/2.8, f/11.0 becomes f/11.
+func trimTrailingZero(f float64) string {
+	s := strconv.FormatFloat(f, 'f', 1, 64)
+	return strings.TrimSuffix(strings.TrimSuffix(s, "0"), ".")
+}
+
+// formatShutterSpeed renders exposures under a second as "1/x s" (the
+// conventional display, even if the stored rational isn't already reduced
+// to a numerator of 1) and exposures of a second or longer as "xs".
+func formatShutterSpeed(num, den int64) string {
+	if num == 1 && den > 1 {
+		return fmt.Sprintf("1/%ds", den)
+	}
+	value := float64(num) / float64(den)
+	if value <= 0 {
+		return ""
+	}
+	if value >= 1 {
+		return trimTrailingZero(value) + "s"
+	}
+	return fmt.Sprintf("1/%.0fs", 1/value)
 }

@@ -43,9 +43,11 @@ func (h *Handler) Register(mux *http.ServeMux, adminWrap func(http.Handler) http
 	mux.HandleFunc("GET /api/music", h.listMusic)
 	mux.Handle("POST /api/admin/albums", adminWrap(http.HandlerFunc(h.createAlbum)))
 	mux.Handle("PATCH /api/admin/albums/{id}", adminWrap(http.HandlerFunc(h.updateAlbum)))
+	mux.Handle("PATCH /api/admin/albums/{id}/cover", adminWrap(http.HandlerFunc(h.updateAlbumCover)))
 	mux.Handle("DELETE /api/admin/albums/{id}", adminWrap(http.HandlerFunc(h.deleteAlbum)))
 	mux.Handle("POST /api/admin/tracks", adminWrap(http.HandlerFunc(h.createTrack)))
 	mux.Handle("PATCH /api/admin/tracks/{id}", adminWrap(http.HandlerFunc(h.updateTrack)))
+	mux.Handle("PATCH /api/admin/tracks/{id}/cover", adminWrap(http.HandlerFunc(h.updateTrackCover)))
 	mux.Handle("DELETE /api/admin/tracks/{id}", adminWrap(http.HandlerFunc(h.deleteTrack)))
 }
 
@@ -286,6 +288,62 @@ func (h *Handler) updateTrack(w http.ResponseWriter, r *http.Request) {
 	httpserver.JSON(w, http.StatusOK, h.withTrackURLs(t))
 }
 
+// updateTrackCover replaces a track's cover art — add it where there wasn't
+// one, or swap an existing one. Cover-only upload, same 15 MB cap as an
+// album cover (the audio file itself is untouched).
+func (h *Handler) updateTrackCover(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAlbumUploadBytes)
+	if err := r.ParseMultipartForm(4 << 20); err != nil {
+		httpserver.Err(w, http.StatusRequestEntityTooLarge, "too_large", "upload exceeds size limit")
+		return
+	}
+
+	coverFile, _, err := r.FormFile("cover")
+	if err != nil {
+		httpserver.Err(w, http.StatusBadRequest, "bad_request", "missing cover field")
+		return
+	}
+	defer coverFile.Close()
+
+	raw, err := io.ReadAll(coverFile)
+	if err != nil {
+		httpserver.Internal(w, err)
+		return
+	}
+	proc, err := imageproc.Process(raw)
+	if errors.Is(err, imageproc.ErrUnsupportedType) {
+		httpserver.Err(w, http.StatusUnsupportedMediaType, "unsupported_type", "only JPEG and PNG are accepted")
+		return
+	}
+	if err != nil {
+		httpserver.Err(w, http.StatusUnprocessableEntity, "invalid_image", "could not process cover image")
+		return
+	}
+
+	ctx := r.Context()
+	cp := fmt.Sprintf("covers/%s.jpg", uuid.NewString())
+	if err := h.storage.Upload(ctx, Bucket, cp, "image/jpeg", bytes.NewReader(proc.Thumbnail)); err != nil {
+		httpserver.Internal(w, err)
+		return
+	}
+
+	updated, previous, err := h.repo.UpdateTrackCover(ctx, r.PathValue("id"), cp)
+	if errors.Is(err, pgx.ErrNoRows) {
+		h.cleanupObjects(cp)
+		httpserver.Err(w, http.StatusNotFound, "not_found", "track not found")
+		return
+	}
+	if err != nil {
+		h.cleanupObjects(cp)
+		httpserver.Internal(w, err)
+		return
+	}
+	if previous != nil {
+		h.cleanupObjects(*previous)
+	}
+	httpserver.JSON(w, http.StatusOK, h.withTrackURLs(updated))
+}
+
 func (h *Handler) deleteTrack(w http.ResponseWriter, r *http.Request) {
 	audioPath, coverPath, err := h.repo.DeleteTrack(r.Context(), r.PathValue("id"))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -375,6 +433,61 @@ func (h *Handler) updateAlbum(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpserver.JSON(w, http.StatusOK, h.withAlbumCoverURL(a))
+}
+
+// updateAlbumCover replaces an album's cover art — add it where there wasn't
+// one, or swap an existing one.
+func (h *Handler) updateAlbumCover(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAlbumUploadBytes)
+	if err := r.ParseMultipartForm(4 << 20); err != nil {
+		httpserver.Err(w, http.StatusRequestEntityTooLarge, "too_large", "upload exceeds size limit")
+		return
+	}
+
+	coverFile, _, err := r.FormFile("cover")
+	if err != nil {
+		httpserver.Err(w, http.StatusBadRequest, "bad_request", "missing cover field")
+		return
+	}
+	defer coverFile.Close()
+
+	raw, err := io.ReadAll(coverFile)
+	if err != nil {
+		httpserver.Internal(w, err)
+		return
+	}
+	proc, err := imageproc.Process(raw)
+	if errors.Is(err, imageproc.ErrUnsupportedType) {
+		httpserver.Err(w, http.StatusUnsupportedMediaType, "unsupported_type", "only JPEG and PNG are accepted")
+		return
+	}
+	if err != nil {
+		httpserver.Err(w, http.StatusUnprocessableEntity, "invalid_image", "could not process cover image")
+		return
+	}
+
+	ctx := r.Context()
+	cp := fmt.Sprintf("covers/%s.jpg", uuid.NewString())
+	if err := h.storage.Upload(ctx, Bucket, cp, "image/jpeg", bytes.NewReader(proc.Thumbnail)); err != nil {
+		httpserver.Internal(w, err)
+		return
+	}
+
+	updated, previous, err := h.repo.UpdateAlbumCover(ctx, r.PathValue("id"), cp)
+	if errors.Is(err, pgx.ErrNoRows) {
+		h.cleanupObjects(cp)
+		httpserver.Err(w, http.StatusNotFound, "not_found", "album not found")
+		return
+	}
+	if err != nil {
+		h.cleanupObjects(cp)
+		httpserver.Internal(w, err)
+		return
+	}
+	if previous != nil {
+		h.cleanupObjects(*previous)
+	}
+	httpserver.JSON(w, http.StatusOK, h.withAlbumCoverURL(updated))
 }
 
 // deleteAlbum removes the album row; its tracks detach to singles via the

@@ -48,16 +48,108 @@ func exifJPEG(t *testing.T, width, height int, orientation uint16) []byte {
 	base := encodeJPEG(t, width, height)
 
 	tiff := new(bytes.Buffer)
-	tiff.WriteString("II")                              // little-endian
-	binary.Write(tiff, binary.LittleEndian, uint16(42))  // TIFF magic
-	binary.Write(tiff, binary.LittleEndian, uint32(8))   // offset to IFD0
-	binary.Write(tiff, binary.LittleEndian, uint16(1))   // 1 entry
+	tiff.WriteString("II")                                  // little-endian
+	binary.Write(tiff, binary.LittleEndian, uint16(42))     // TIFF magic
+	binary.Write(tiff, binary.LittleEndian, uint32(8))      // offset to IFD0
+	binary.Write(tiff, binary.LittleEndian, uint16(1))      // 1 entry
 	binary.Write(tiff, binary.LittleEndian, uint16(0x0112)) // tag: Orientation
-	binary.Write(tiff, binary.LittleEndian, uint16(3))   // type: SHORT
-	binary.Write(tiff, binary.LittleEndian, uint32(1))   // count
-	binary.Write(tiff, binary.LittleEndian, orientation) // value (+2 pad bytes)
+	binary.Write(tiff, binary.LittleEndian, uint16(3))      // type: SHORT
+	binary.Write(tiff, binary.LittleEndian, uint32(1))      // count
+	binary.Write(tiff, binary.LittleEndian, orientation)    // value (+2 pad bytes)
 	binary.Write(tiff, binary.LittleEndian, uint16(0))
 	binary.Write(tiff, binary.LittleEndian, uint32(0)) // next IFD offset
+
+	payload := append([]byte("Exif\x00\x00"), tiff.Bytes()...)
+
+	segment := new(bytes.Buffer)
+	segment.Write([]byte{0xFF, 0xE1})
+	binary.Write(segment, binary.BigEndian, uint16(len(payload)+2))
+	segment.Write(payload)
+
+	out := new(bytes.Buffer)
+	out.Write(base[:2]) // SOI
+	out.Write(segment.Bytes())
+	out.Write(base[2:])
+	return out.Bytes()
+}
+
+// ifdEntry describes one TIFF IFD0 entry for exifJPEGWithTags. value holds
+// the raw bytes for the tag's data; if it's 4 bytes or less it's inlined
+// in the entry itself (TIFF's rule), otherwise it's appended after the IFD
+// and the entry stores an offset to it instead.
+type ifdEntry struct {
+	tag   uint16
+	typ   uint16
+	count uint32
+	value []byte
+}
+
+func asciiValue(s string) []byte { return append([]byte(s), 0) }
+
+func shortValue(v uint16) []byte {
+	b := make([]byte, 4)
+	binary.LittleEndian.PutUint16(b, v)
+	return b
+}
+
+func rationalValue(num, den uint32) []byte {
+	b := make([]byte, 8)
+	binary.LittleEndian.PutUint32(b[0:4], num)
+	binary.LittleEndian.PutUint32(b[4:8], den)
+	return b
+}
+
+// exifJPEGWithTags splices a hand-built EXIF APP1 segment with an arbitrary
+// set of IFD0 entries into an otherwise-valid JPEG. Unlike exifJPEG (single
+// inline SHORT tag), this handles external (>4 byte) values too — ASCII
+// strings and RATIONALs — computing their offsets rather than hand-counting
+// bytes, so it's not a error-prone arithmetic exercise per call site.
+//
+// goexif's field-name lookup is flat across whichever IFD a tag was found
+// in (confirmed by reading exif.go: (*Exif).main is populated by the same
+// exifFields map for IFD0 as for the Exif sub-IFD), so real EXIF's
+// IFD0-vs-sub-IFD split doesn't need to be reproduced here — every tag
+// below can live directly in IFD0.
+func exifJPEGWithTags(t *testing.T, width, height int, entries []ifdEntry) []byte {
+	t.Helper()
+	base := encodeJPEG(t, width, height)
+
+	const tiffHeaderLen = 8 // "II" + magic(2) + ifd0 offset(4)
+	ifdStart := tiffHeaderLen
+	ifdLen := 2 + len(entries)*12 + 4 // count + entries + next-IFD-offset
+	externalStart := ifdStart + ifdLen
+
+	var external bytes.Buffer
+	offsets := make([]uint32, len(entries))
+	for i, e := range entries {
+		if len(e.value) > 4 {
+			offsets[i] = uint32(externalStart + external.Len())
+			external.Write(e.value)
+			if external.Len()%2 == 1 {
+				external.WriteByte(0) // keep the next entry word-aligned
+			}
+		}
+	}
+
+	tiff := new(bytes.Buffer)
+	tiff.WriteString("II")
+	binary.Write(tiff, binary.LittleEndian, uint16(42))
+	binary.Write(tiff, binary.LittleEndian, uint32(ifdStart))
+	binary.Write(tiff, binary.LittleEndian, uint16(len(entries)))
+	for i, e := range entries {
+		binary.Write(tiff, binary.LittleEndian, e.tag)
+		binary.Write(tiff, binary.LittleEndian, e.typ)
+		binary.Write(tiff, binary.LittleEndian, e.count)
+		if len(e.value) > 4 {
+			binary.Write(tiff, binary.LittleEndian, offsets[i])
+		} else {
+			padded := make([]byte, 4)
+			copy(padded, e.value)
+			tiff.Write(padded)
+		}
+	}
+	binary.Write(tiff, binary.LittleEndian, uint32(0)) // next IFD offset
+	tiff.Write(external.Bytes())
 
 	payload := append([]byte("Exif\x00\x00"), tiff.Bytes()...)
 
@@ -108,9 +200,9 @@ func decodedWidth(t *testing.T, jpegBytes []byte) int {
 
 func TestProcess_AcceptsValidJPEGAndPNG(t *testing.T) {
 	cases := []struct {
-		name    string
-		raw     []byte
-		wantExt string
+		name     string
+		raw      []byte
+		wantExt  string
 		wantMIME string
 	}{
 		{"jpeg", encodeJPEG(t, 100, 80), "jpg", "image/jpeg"},
@@ -208,5 +300,117 @@ func TestProcess_ThumbnailNotUpscaledWhenNarrow(t *testing.T) {
 	}
 	if got := decodedWidth(t, proc.Thumbnail); got != 400 {
 		t.Errorf("thumbnail width = %d, want 400 (unchanged, not upscaled to %d)", got, thumbWidth)
+	}
+}
+
+func TestProcess_ExtractsExifCameraSettings(t *testing.T) {
+	raw := exifJPEGWithTags(t, 100, 80, []ifdEntry{
+		{tag: 0x010F, typ: 2, count: 6, value: asciiValue("Canon")},          // Make
+		{tag: 0x0110, typ: 2, count: 13, value: asciiValue("Canon EOS R5")}, // Model
+		{tag: 0x829A, typ: 5, count: 1, value: rationalValue(1, 250)},      // ExposureTime
+		{tag: 0x829D, typ: 5, count: 1, value: rationalValue(28, 10)},      // FNumber
+		{tag: 0x8827, typ: 3, count: 1, value: shortValue(400)},            // ISOSpeedRatings
+		{tag: 0x920A, typ: 5, count: 1, value: rationalValue(50, 1)},       // FocalLength
+	})
+
+	proc, err := Process(raw)
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if proc.Exif == nil {
+		t.Fatal("Exif is nil, want extracted camera settings")
+	}
+	if proc.Exif.Camera != "Canon EOS R5" {
+		t.Errorf("Camera = %q, want %q (deduped, not \"Canon Canon EOS R5\")", proc.Exif.Camera, "Canon EOS R5")
+	}
+	if proc.Exif.Aperture != "f/2.8" {
+		t.Errorf("Aperture = %q, want %q", proc.Exif.Aperture, "f/2.8")
+	}
+	if proc.Exif.ShutterSpeed != "1/250s" {
+		t.Errorf("ShutterSpeed = %q, want %q", proc.Exif.ShutterSpeed, "1/250s")
+	}
+	if proc.Exif.ISO != "ISO 400" {
+		t.Errorf("ISO = %q, want %q", proc.Exif.ISO, "ISO 400")
+	}
+	if proc.Exif.FocalLength != "50mm" {
+		t.Errorf("FocalLength = %q, want %q", proc.Exif.FocalLength, "50mm")
+	}
+}
+
+func TestProcess_CombinesMakeAndModelWhenModelLacksMake(t *testing.T) {
+	raw := exifJPEGWithTags(t, 100, 80, []ifdEntry{
+		{tag: 0x010F, typ: 2, count: 6, value: asciiValue("Canon")},
+		{tag: 0x0110, typ: 2, count: 6, value: asciiValue("EOS R5")}, // doesn't already contain "Canon"
+	})
+
+	proc, err := Process(raw)
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if proc.Exif == nil || proc.Exif.Camera != "Canon EOS R5" {
+		t.Errorf("Camera = %v, want %q", proc.Exif, "Canon EOS R5")
+	}
+}
+
+func TestProcess_FormatsWholeNumberApertureWithoutDecimal(t *testing.T) {
+	raw := exifJPEGWithTags(t, 100, 80, []ifdEntry{
+		{tag: 0x829D, typ: 5, count: 1, value: rationalValue(110, 10)}, // f/11.0
+	})
+
+	proc, err := Process(raw)
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if proc.Exif == nil || proc.Exif.Aperture != "f/11" {
+		t.Errorf("Aperture = %v, want %q (no trailing .0)", proc.Exif, "f/11")
+	}
+}
+
+func TestProcess_FormatsSlowShutterSpeedInSeconds(t *testing.T) {
+	raw := exifJPEGWithTags(t, 100, 80, []ifdEntry{
+		{tag: 0x829A, typ: 5, count: 1, value: rationalValue(2, 1)}, // 2 second exposure
+	})
+
+	proc, err := Process(raw)
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if proc.Exif == nil || proc.Exif.ShutterSpeed != "2s" {
+		t.Errorf("ShutterSpeed = %v, want %q", proc.Exif, "2s")
+	}
+}
+
+func TestProcess_ExifNilWhenNoRecognizedFieldsPresent(t *testing.T) {
+	// Orientation is real EXIF data, but not one of the fields the
+	// viewfinder overlay shows — extraction should find nothing worth
+	// surfacing and return nil, not a struct of empty strings.
+	raw := exifJPEG(t, 100, 80, 1)
+
+	proc, err := Process(raw)
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if proc.Exif != nil {
+		t.Errorf("Exif = %+v, want nil (only Orientation was present)", proc.Exif)
+	}
+}
+
+func TestProcess_ExifNilWhenJPEGHasNoExifSegment(t *testing.T) {
+	proc, err := Process(encodeJPEG(t, 100, 80))
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if proc.Exif != nil {
+		t.Errorf("Exif = %+v, want nil (no EXIF segment at all)", proc.Exif)
+	}
+}
+
+func TestProcess_ExifNilForPNG(t *testing.T) {
+	proc, err := Process(encodePNG(t, 100, 80))
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if proc.Exif != nil {
+		t.Errorf("Exif = %+v, want nil (PNGs have no EXIF)", proc.Exif)
 	}
 }

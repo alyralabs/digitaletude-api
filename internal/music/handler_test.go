@@ -6,6 +6,9 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -137,6 +140,40 @@ func multipartAlbumBody(t *testing.T, fields map[string]string) (*bytes.Buffer, 
 		if err := w.WriteField(k, v); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf, w.FormDataContentType()
+}
+
+// testJPEG returns a real, decodable JPEG — unlike testMP3, imageproc.Process
+// actually decodes cover uploads, so a magic-byte-only stub won't do here.
+func testJPEG(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 100, 80))
+	for y := 0; y < 80; y++ {
+		for x := 0; x < 100; x++ {
+			img.Set(x, y, color.NRGBA{R: 10, G: 20, B: 30, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatalf("encoding test JPEG: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func multipartCoverBody(t *testing.T, fileBytes []byte) (*bytes.Buffer, string) {
+	t.Helper()
+	buf := new(bytes.Buffer)
+	w := multipart.NewWriter(buf)
+	fw, err := w.CreateFormFile("cover", "cover.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(fileBytes); err != nil {
+		t.Fatal(err)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
@@ -481,5 +518,303 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 	mux.ServeHTTP(albumDelRec, albumDelReq)
 	if albumDelRec.Code != http.StatusNotFound {
 		t.Errorf("DELETE unknown album id status = %d, want 404", albumDelRec.Code)
+	}
+}
+
+// createAlbumWithCover builds the create request directly (rather than via
+// multipartAlbumBody, which only handles text fields) so it includes a real
+// cover file.
+func createAlbumWithCover(t *testing.T, mux *http.ServeMux, token string) Album {
+	t.Helper()
+	buf := new(bytes.Buffer)
+	w := multipart.NewWriter(buf)
+	_ = w.WriteField("title", "Has A Cover")
+	fw, err := w.CreateFormFile("cover", "cover.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fw.Write(testJPEG(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/albums", buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup: create album with cover status = %d, want 201, body: %s", rec.Code, rec.Body.String())
+	}
+	var a Album
+	if err := json.Unmarshal(rec.Body.Bytes(), &a); err != nil {
+		t.Fatalf("decoding create response: %v", err)
+	}
+	if a.CoverURL == nil {
+		t.Fatal("setup: expected the created album to have a cover")
+	}
+	return a
+}
+
+// createTrackWithCover is createAlbumWithCover's track equivalent.
+func createTrackWithCover(t *testing.T, mux *http.ServeMux, token string) Track {
+	t.Helper()
+	buf := new(bytes.Buffer)
+	w := multipart.NewWriter(buf)
+	_ = w.WriteField("title", "Has A Cover")
+	audioFw, err := w.CreateFormFile("file", "test.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := audioFw.Write(testMP3()); err != nil {
+		t.Fatal(err)
+	}
+	coverFw, err := w.CreateFormFile("cover", "cover.jpg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coverFw.Write(testJPEG(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup: create track with cover status = %d, want 201, body: %s", rec.Code, rec.Body.String())
+	}
+	var tr Track
+	if err := json.Unmarshal(rec.Body.Bytes(), &tr); err != nil {
+		t.Fatalf("decoding create response: %v", err)
+	}
+	if tr.CoverURL == nil {
+		t.Fatal("setup: expected the created track to have a cover")
+	}
+	return tr
+}
+
+func TestHandler_UpdateAlbumCover_AddsCoverToAlbumThatHadNone(t *testing.T) {
+	mux, token := newTestServer(t)
+	body, contentType := multipartAlbumBody(t, map[string]string{"title": "No Cover Yet"})
+	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/albums", body)
+	createReq.Header.Set("Content-Type", contentType)
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created Album
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decoding create response: %v", err)
+	}
+	if created.CoverURL != nil {
+		t.Fatalf("setup: expected no cover, got %v", created.CoverURL)
+	}
+
+	coverBody, coverContentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/albums/"+created.ID+"/cover", coverBody)
+	req.Header.Set("Content-Type", coverContentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	var updated Album
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if updated.CoverURL == nil || *updated.CoverURL == "" {
+		t.Error("expected a cover URL after uploading a cover, got none")
+	}
+}
+
+func TestHandler_UpdateAlbumCover_ReplacesExistingCoverAndCleansUpOld(t *testing.T) {
+	mux, token := newFailingStorageTestServer(t)
+	created := createAlbumWithCover(t, mux, token)
+	firstCoverURL := *created.CoverURL
+
+	body, contentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/albums/"+created.ID+"/cover", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	// newFailingStorageTestServer fails DELETE only — the replace must still
+	// succeed even though best-effort cleanup of the old cover fails.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	var updated Album
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if updated.CoverURL == nil || *updated.CoverURL == firstCoverURL {
+		t.Errorf("CoverURL = %v, want a new URL different from the original %q", updated.CoverURL, firstCoverURL)
+	}
+}
+
+func TestHandler_UpdateAlbumCover_RejectsNonImage(t *testing.T) {
+	mux, token := newTestServer(t)
+	body, contentType := multipartAlbumBody(t, map[string]string{"title": "Bad Cover Target"})
+	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/albums", body)
+	createReq.Header.Set("Content-Type", contentType)
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created Album
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decoding create response: %v", err)
+	}
+
+	coverBody, coverContentType := multipartCoverBody(t, []byte("not an image"))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/albums/"+created.ID+"/cover", coverBody)
+	req.Header.Set("Content-Type", coverContentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("status = %d, want 415", rec.Code)
+	}
+}
+
+func TestHandler_UpdateAlbumCover_UnknownIDReturns404(t *testing.T) {
+	mux, token := newTestServer(t)
+	unknownID := "00000000-0000-0000-0000-000000000000"
+
+	body, contentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/albums/"+unknownID+"/cover", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestHandler_UpdateTrackCover_AddsCoverToTrackThatHadNone(t *testing.T) {
+	mux, token := newTestServer(t)
+	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "No Cover Yet"}, testMP3())
+	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
+	createReq.Header.Set("Content-Type", contentType)
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created Track
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decoding create response: %v", err)
+	}
+	if created.CoverURL != nil {
+		t.Fatalf("setup: expected no cover, got %v", created.CoverURL)
+	}
+
+	coverBody, coverContentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/tracks/"+created.ID+"/cover", coverBody)
+	req.Header.Set("Content-Type", coverContentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	var updated Track
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if updated.CoverURL == nil || *updated.CoverURL == "" {
+		t.Error("expected a cover URL after uploading a cover, got none")
+	}
+}
+
+func TestHandler_UpdateTrackCover_ReplacesExistingCoverAndCleansUpOld(t *testing.T) {
+	mux, token := newFailingStorageTestServer(t)
+	created := createTrackWithCover(t, mux, token)
+	firstCoverURL := *created.CoverURL
+
+	body, contentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/tracks/"+created.ID+"/cover", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	var updated Track
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if updated.CoverURL == nil || *updated.CoverURL == firstCoverURL {
+		t.Errorf("CoverURL = %v, want a new URL different from the original %q", updated.CoverURL, firstCoverURL)
+	}
+}
+
+func TestHandler_UpdateTrackCover_RejectsNonImage(t *testing.T) {
+	mux, token := newTestServer(t)
+	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "Bad Cover Target"}, testMP3())
+	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
+	createReq.Header.Set("Content-Type", contentType)
+	createReq.Header.Set("Authorization", "Bearer "+token)
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	var created Track
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decoding create response: %v", err)
+	}
+
+	coverBody, coverContentType := multipartCoverBody(t, []byte("not an image"))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/tracks/"+created.ID+"/cover", coverBody)
+	req.Header.Set("Content-Type", coverContentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("status = %d, want 415", rec.Code)
+	}
+}
+
+func TestHandler_UpdateTrackCover_UnknownIDReturns404(t *testing.T) {
+	mux, token := newTestServer(t)
+	unknownID := "00000000-0000-0000-0000-000000000000"
+
+	body, contentType := multipartCoverBody(t, testJPEG(t))
+	req := httptest.NewRequest(http.MethodPatch, "/api/admin/tracks/"+unknownID+"/cover", body)
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestHandler_UpdateCover_RequiresAuth(t *testing.T) {
+	mux, _ := newTestServer(t)
+	unknownID := "00000000-0000-0000-0000-000000000000"
+	body, contentType := multipartCoverBody(t, testJPEG(t))
+
+	for _, path := range []string{
+		"/api/admin/albums/" + unknownID + "/cover",
+		"/api/admin/tracks/" + unknownID + "/cover",
+	} {
+		req := httptest.NewRequest(http.MethodPatch, path, bytes.NewReader(body.Bytes()))
+		req.Header.Set("Content-Type", contentType)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s status = %d, want 401", path, rec.Code)
+		}
 	}
 }

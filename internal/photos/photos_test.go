@@ -2,6 +2,7 @@ package photos
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -152,5 +153,57 @@ func TestRepo_Delete_RemovesRowAndReturnsPaths(t *testing.T) {
 	_, err = repo.Get(context.Background(), created.ID)
 	if !errors.Is(err, pgx.ErrNoRows) {
 		t.Errorf("Get() after Delete() error = %v, want pgx.ErrNoRows", err)
+	}
+}
+
+func TestRepo_Insert_PersistsExif(t *testing.T) {
+	repo := NewRepo(testutil.OpenTestTx(t))
+
+	created, err := repo.Insert(context.Background(), &Photo{
+		Title:         "Has Exif",
+		StoragePath:   "originals/has-exif.jpg",
+		ThumbnailPath: "thumbnails/has-exif.jpg",
+		Width:         800,
+		Height:        600,
+		Exif:          json.RawMessage(`{"camera":"Canon EOS R5","aperture":"f/2.8"}`),
+	})
+	if err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	// jsonb reformats on the way in (e.g. adds a space after ":"), so
+	// compare decoded values, not raw bytes.
+	want := map[string]string{"camera": "Canon EOS R5", "aperture": "f/2.8"}
+	assertExifEquals(t, created.Exif, want, "Insert()")
+
+	fetched, err := repo.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	assertExifEquals(t, fetched.Exif, want, "Get() after Insert()")
+}
+
+func assertExifEquals(t *testing.T, raw json.RawMessage, want map[string]string, context string) {
+	t.Helper()
+	var got map[string]string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("%s: decoding Exif: %v", context, err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%s: Exif = %v, want %v", context, got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: Exif[%q] = %q, want %q", context, k, got[k], v)
+		}
+	}
+}
+
+func TestRepo_Insert_ExifNilWhenNotProvided(t *testing.T) {
+	repo := NewRepo(testutil.OpenTestTx(t))
+	created := insertTestPhoto(t, repo, "No Exif")
+
+	if created.Exif != nil {
+		t.Errorf("Exif = %s, want nil when the upload had none", created.Exif)
 	}
 }
