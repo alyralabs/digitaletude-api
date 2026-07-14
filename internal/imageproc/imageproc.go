@@ -9,6 +9,7 @@ import (
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -201,19 +202,27 @@ func ratTag(x *exif.Exif, name exif.FieldName) (num, den int64, err error) {
 	return tag.Rat2(0)
 }
 
-// combineCameraName joins make + model, deduping the common case where the
-// model already includes the make (e.g. "Canon EOS R5").
+// combineCameraName joins make + model, deduping when the model already
+// carries the brand. Full-string containment handles "Canon" + "Canon EOS
+// R5"; the first-word comparison handles corporate-suffix makes like
+// "NIKON CORPORATION" + "NIKON D850", which are the majority shape among
+// the big vendors.
 func combineCameraName(cameraMake, model string) string {
 	cameraMake = strings.TrimSpace(cameraMake)
 	model = strings.TrimSpace(model)
-	switch {
-	case model == "":
+	if model == "" {
 		return cameraMake
-	case cameraMake == "" || strings.Contains(strings.ToLower(model), strings.ToLower(cameraMake)):
-		return model
-	default:
-		return cameraMake + " " + model
 	}
+	if cameraMake == "" {
+		return model
+	}
+	makeBrand := strings.ToLower(strings.Fields(cameraMake)[0])
+	modelBrand := strings.ToLower(strings.Fields(model)[0])
+	if modelBrand == makeBrand ||
+		strings.Contains(strings.ToLower(model), strings.ToLower(cameraMake)) {
+		return model
+	}
+	return cameraMake + " " + model
 }
 
 func formatAperture(f float64) string {
@@ -231,9 +240,12 @@ func trimTrailingZero(f float64) string {
 	return strings.TrimSuffix(strings.TrimSuffix(s, "0"), ".")
 }
 
-// formatShutterSpeed renders exposures under a second as "1/x s" (the
-// conventional display, even if the stored rational isn't already reduced
-// to a numerator of 1) and exposures of a second or longer as "xs".
+// formatShutterSpeed renders sub-second exposures as "1/x s" when the value
+// genuinely is (within tolerance) a unit fraction — covering both unreduced
+// rationals like 2/500 and decimal-rational storage like 333333/1000000 —
+// and as decimal seconds otherwise, matching cameras' own convention for
+// slow shutters (0.7s displays as 0"7, never as a rounded-wrong "1/1").
+// Exposures of a second or longer are always decimal seconds.
 func formatShutterSpeed(num, den int64) string {
 	if num == 1 && den > 1 {
 		return fmt.Sprintf("1/%ds", den)
@@ -245,5 +257,9 @@ func formatShutterSpeed(num, den int64) string {
 	if value >= 1 {
 		return trimTrailingZero(value) + "s"
 	}
-	return fmt.Sprintf("1/%.0fs", 1/value)
+	reciprocal := math.Round(1 / value)
+	if math.Abs(1/reciprocal-value) <= value*0.02 {
+		return fmt.Sprintf("1/%.0fs", reciprocal)
+	}
+	return trimTrailingZero(value) + "s"
 }

@@ -291,43 +291,56 @@ func (h *Handler) updateTrack(w http.ResponseWriter, r *http.Request) {
 // updateTrackCover replaces a track's cover art — add it where there wasn't
 // one, or swap an existing one. Cover-only upload, same 15 MB cap as an
 // album cover (the audio file itself is untouched).
-func (h *Handler) updateTrackCover(w http.ResponseWriter, r *http.Request) {
+// receiveCover is the shared front half of the two cover-replacement
+// handlers: it validates the multipart "cover" upload, thumbnails it, and
+// stores it under a fresh path. On failure it writes the error response
+// itself and returns ok=false. The back half (row update + cleanup of
+// old/new objects) stays in each handler — that's where album and track
+// genuinely differ.
+func (h *Handler) receiveCover(w http.ResponseWriter, r *http.Request) (coverPath string, ok bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxAlbumUploadBytes)
 	if err := r.ParseMultipartForm(4 << 20); err != nil {
 		httpserver.Err(w, http.StatusRequestEntityTooLarge, "too_large", "upload exceeds size limit")
-		return
+		return "", false
 	}
 
 	coverFile, _, err := r.FormFile("cover")
 	if err != nil {
 		httpserver.Err(w, http.StatusBadRequest, "bad_request", "missing cover field")
-		return
+		return "", false
 	}
 	defer coverFile.Close()
 
 	raw, err := io.ReadAll(coverFile)
 	if err != nil {
 		httpserver.Internal(w, err)
-		return
+		return "", false
 	}
 	proc, err := imageproc.Process(raw)
 	if errors.Is(err, imageproc.ErrUnsupportedType) {
 		httpserver.Err(w, http.StatusUnsupportedMediaType, "unsupported_type", "only JPEG and PNG are accepted")
-		return
+		return "", false
 	}
 	if err != nil {
 		httpserver.Err(w, http.StatusUnprocessableEntity, "invalid_image", "could not process cover image")
-		return
+		return "", false
 	}
 
-	ctx := r.Context()
 	cp := fmt.Sprintf("covers/%s.jpg", uuid.NewString())
-	if err := h.storage.Upload(ctx, Bucket, cp, "image/jpeg", bytes.NewReader(proc.Thumbnail)); err != nil {
+	if err := h.storage.Upload(r.Context(), Bucket, cp, "image/jpeg", bytes.NewReader(proc.Thumbnail)); err != nil {
 		httpserver.Internal(w, err)
+		return "", false
+	}
+	return cp, true
+}
+
+func (h *Handler) updateTrackCover(w http.ResponseWriter, r *http.Request) {
+	cp, ok := h.receiveCover(w, r)
+	if !ok {
 		return
 	}
 
-	updated, previous, err := h.repo.UpdateTrackCover(ctx, r.PathValue("id"), cp)
+	updated, previous, err := h.repo.UpdateTrackCover(r.Context(), r.PathValue("id"), cp)
 	if errors.Is(err, pgx.ErrNoRows) {
 		h.cleanupObjects(cp)
 		httpserver.Err(w, http.StatusNotFound, "not_found", "track not found")
@@ -438,42 +451,12 @@ func (h *Handler) updateAlbum(w http.ResponseWriter, r *http.Request) {
 // updateAlbumCover replaces an album's cover art — add it where there wasn't
 // one, or swap an existing one.
 func (h *Handler) updateAlbumCover(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxAlbumUploadBytes)
-	if err := r.ParseMultipartForm(4 << 20); err != nil {
-		httpserver.Err(w, http.StatusRequestEntityTooLarge, "too_large", "upload exceeds size limit")
+	cp, ok := h.receiveCover(w, r)
+	if !ok {
 		return
 	}
 
-	coverFile, _, err := r.FormFile("cover")
-	if err != nil {
-		httpserver.Err(w, http.StatusBadRequest, "bad_request", "missing cover field")
-		return
-	}
-	defer coverFile.Close()
-
-	raw, err := io.ReadAll(coverFile)
-	if err != nil {
-		httpserver.Internal(w, err)
-		return
-	}
-	proc, err := imageproc.Process(raw)
-	if errors.Is(err, imageproc.ErrUnsupportedType) {
-		httpserver.Err(w, http.StatusUnsupportedMediaType, "unsupported_type", "only JPEG and PNG are accepted")
-		return
-	}
-	if err != nil {
-		httpserver.Err(w, http.StatusUnprocessableEntity, "invalid_image", "could not process cover image")
-		return
-	}
-
-	ctx := r.Context()
-	cp := fmt.Sprintf("covers/%s.jpg", uuid.NewString())
-	if err := h.storage.Upload(ctx, Bucket, cp, "image/jpeg", bytes.NewReader(proc.Thumbnail)); err != nil {
-		httpserver.Internal(w, err)
-		return
-	}
-
-	updated, previous, err := h.repo.UpdateAlbumCover(ctx, r.PathValue("id"), cp)
+	updated, previous, err := h.repo.UpdateAlbumCover(r.Context(), r.PathValue("id"), cp)
 	if errors.Is(err, pgx.ErrNoRows) {
 		h.cleanupObjects(cp)
 		httpserver.Err(w, http.StatusNotFound, "not_found", "album not found")

@@ -117,16 +117,12 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A malformed EXIF segment shouldn't fail the upload any more than a
-	// missing one does — proc.Exif is already nil in that case, so this
-	// marshal is only reached with well-formed data and won't itself fail.
+	// Error deliberately ignored: marshaling a struct of plain strings
+	// cannot fail, and a malformed EXIF segment already surfaces as a nil
+	// proc.Exif upstream rather than reaching this point.
 	var exifJSON json.RawMessage
 	if proc.Exif != nil {
-		exifJSON, err = json.Marshal(proc.Exif)
-		if err != nil {
-			httpserver.Internal(w, err)
-			return
-		}
+		exifJSON, _ = json.Marshal(proc.Exif)
 	}
 
 	photo := &Photo{

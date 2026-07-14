@@ -414,3 +414,56 @@ func TestProcess_ExifNilForPNG(t *testing.T) {
 		t.Errorf("Exif = %+v, want nil (PNGs have no EXIF)", proc.Exif)
 	}
 }
+
+// Direct table tests for the two formatting helpers — the through-Process
+// tests above cover wiring; these cover the value-space edge cases that a
+// full JPEG fixture per case would make prohibitively verbose. Same
+// pure-function-table pattern as posts' slug_test.go.
+
+func TestFormatShutterSpeed(t *testing.T) {
+	cases := []struct {
+		name     string
+		num, den int64
+		want     string
+	}{
+		{"fast, stored as unit fraction", 1, 250, "1/250s"},
+		{"fast, stored unreduced", 2, 500, "1/250s"},
+		{"one third stored as decimal rational", 333333, 1000000, "1/3s"},
+		{"half second", 5, 10, "1/2s"},
+		{"0.7s long exposure is not 1/1s", 7, 10, "0.7s"},
+		{"0.6s long exposure is not 1/2s", 6, 10, "0.6s"},
+		{"exactly one second", 1, 1, "1s"},
+		{"multi-second", 2, 1, "2s"},
+		{"fractional seconds over one", 15, 10, "1.5s"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatShutterSpeed(tc.num, tc.den); got != tc.want {
+				t.Errorf("formatShutterSpeed(%d, %d) = %q, want %q", tc.num, tc.den, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCombineCameraName(t *testing.T) {
+	cases := []struct {
+		name        string
+		make, model string
+		want        string
+	}{
+		{"model already contains full make", "Canon", "Canon EOS R5", "Canon EOS R5"},
+		{"corporate-suffix make dedups by brand word", "NIKON CORPORATION", "NIKON D850", "NIKON D850"},
+		{"another corporate suffix", "OLYMPUS IMAGING CORP.", "OLYMPUS E-M1", "OLYMPUS E-M1"},
+		{"model lacks brand entirely", "SONY", "ILCE-7M4", "SONY ILCE-7M4"},
+		{"make only", "Canon", "", "Canon"},
+		{"model only", "", "EOS R5", "EOS R5"},
+		{"case-insensitive dedup", "canon", "Canon EOS R5", "Canon EOS R5"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := combineCameraName(tc.make, tc.model); got != tc.want {
+				t.Errorf("combineCameraName(%q, %q) = %q, want %q", tc.make, tc.model, got, tc.want)
+			}
+		})
+	}
+}
