@@ -6,7 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/alyralabs/digitaletude-api/internal/db"
 )
 
 const Bucket = "music"
@@ -42,11 +43,11 @@ type Track struct {
 }
 
 type Repo struct {
-	pool *pgxpool.Pool
+	db db.Querier
 }
 
-func NewRepo(pool *pgxpool.Pool) *Repo {
-	return &Repo{pool: pool}
+func NewRepo(q db.Querier) *Repo {
+	return &Repo{db: q}
 }
 
 const albumCols = "id, title, description, cover_image_path, sort_order, created_at, metadata"
@@ -75,7 +76,7 @@ func scanTrack(row pgx.Row) (*Track, error) {
 }
 
 func (r *Repo) ListAlbums(ctx context.Context) ([]*Album, error) {
-	rows, err := r.pool.Query(ctx,
+	rows, err := r.db.Query(ctx,
 		"select "+albumCols+" from albums order by sort_order, created_at desc")
 	if err != nil {
 		return nil, err
@@ -97,7 +98,7 @@ func (r *Repo) ListAlbums(ctx context.Context) ([]*Album, error) {
 // their album, singles by sort_order/created_at. Grouping happens in the
 // handler.
 func (r *Repo) ListTracks(ctx context.Context) ([]*Track, error) {
-	rows, err := r.pool.Query(ctx,
+	rows, err := r.db.Query(ctx,
 		"select "+trackCols+" from tracks order by album_id, track_number, sort_order, created_at desc")
 	if err != nil {
 		return nil, err
@@ -116,7 +117,7 @@ func (r *Repo) ListTracks(ctx context.Context) ([]*Track, error) {
 }
 
 func (r *Repo) InsertAlbum(ctx context.Context, a *Album) (*Album, error) {
-	return scanAlbum(r.pool.QueryRow(ctx,
+	return scanAlbum(r.db.QueryRow(ctx,
 		`insert into albums (title, description, cover_image_path, metadata)
 		 values ($1, $2, $3, coalesce($4, '{}'::jsonb))
 		 returning `+albumCols,
@@ -131,7 +132,7 @@ type AlbumUpdate struct {
 }
 
 func (r *Repo) UpdateAlbum(ctx context.Context, id string, u AlbumUpdate) (*Album, error) {
-	return scanAlbum(r.pool.QueryRow(ctx,
+	return scanAlbum(r.db.QueryRow(ctx,
 		`update albums set
 		   title = coalesce($2, title),
 		   description = coalesce($3, description),
@@ -146,13 +147,13 @@ func (r *Repo) UpdateAlbum(ctx context.Context, id string, u AlbumUpdate) (*Albu
 // FK's on delete set null. Returns the cover path (may be nil) for cleanup.
 func (r *Repo) DeleteAlbum(ctx context.Context, id string) (*string, error) {
 	var cover *string
-	err := r.pool.QueryRow(ctx,
+	err := r.db.QueryRow(ctx,
 		"delete from albums where id = $1 returning cover_image_path", id).Scan(&cover)
 	return cover, err
 }
 
 func (r *Repo) InsertTrack(ctx context.Context, t *Track) (*Track, error) {
-	return scanTrack(r.pool.QueryRow(ctx,
+	return scanTrack(r.db.QueryRow(ctx,
 		`insert into tracks (title, description, storage_path, cover_image_path, duration_seconds, album_id, track_number)
 		 values ($1, $2, $3, $4, $5, $6, $7)
 		 returning `+trackCols,
@@ -171,7 +172,7 @@ type TrackUpdate struct {
 }
 
 func (r *Repo) UpdateTrack(ctx context.Context, id string, u TrackUpdate) (*Track, error) {
-	return scanTrack(r.pool.QueryRow(ctx,
+	return scanTrack(r.db.QueryRow(ctx,
 		`update tracks set
 		   title = coalesce($2, title),
 		   description = coalesce($3, description),
@@ -195,7 +196,7 @@ func (r *Repo) UpdateTrack(ctx context.Context, id string, u TrackUpdate) (*Trac
 // DeleteTrack removes the row and returns storage paths for cleanup (cover
 // may be nil). Row first, storage after — same reasoning as photos.
 func (r *Repo) DeleteTrack(ctx context.Context, id string) (storagePath string, coverPath *string, err error) {
-	err = r.pool.QueryRow(ctx,
+	err = r.db.QueryRow(ctx,
 		"delete from tracks where id = $1 returning storage_path, cover_image_path", id).
 		Scan(&storagePath, &coverPath)
 	return storagePath, coverPath, err
