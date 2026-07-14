@@ -6,7 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/alyralabs/digitaletude-api/internal/db"
 )
 
 const Bucket = "blog"
@@ -29,11 +30,11 @@ type Post struct {
 }
 
 type Repo struct {
-	pool *pgxpool.Pool
+	db db.Querier
 }
 
-func NewRepo(pool *pgxpool.Pool) *Repo {
-	return &Repo{pool: pool}
+func NewRepo(q db.Querier) *Repo {
+	return &Repo{db: q}
 }
 
 const postCols = "id, slug, title, excerpt, content_markdown, cover_image_path, status, created_at, updated_at, published_at"
@@ -64,7 +65,7 @@ func scanPosts(rows pgx.Rows) ([]*Post, error) {
 // ListPublished returns published posts newest-first, matching the
 // posts_published_idx query shape.
 func (r *Repo) ListPublished(ctx context.Context) ([]*Post, error) {
-	rows, err := r.pool.Query(ctx,
+	rows, err := r.db.Query(ctx,
 		"select "+postCols+" from posts where status = 'published' order by published_at desc")
 	if err != nil {
 		return nil, err
@@ -75,7 +76,7 @@ func (r *Repo) ListPublished(ctx context.Context) ([]*Post, error) {
 // ListAll returns every post regardless of status, most recently worked-on
 // first, for the admin list.
 func (r *Repo) ListAll(ctx context.Context) ([]*Post, error) {
-	rows, err := r.pool.Query(ctx,
+	rows, err := r.db.Query(ctx,
 		"select "+postCols+" from posts order by updated_at desc")
 	if err != nil {
 		return nil, err
@@ -85,7 +86,7 @@ func (r *Repo) ListAll(ctx context.Context) ([]*Post, error) {
 
 // Get returns a post by id regardless of status, for the admin editor.
 func (r *Repo) Get(ctx context.Context, id string) (*Post, error) {
-	return scanPost(r.pool.QueryRow(ctx,
+	return scanPost(r.db.QueryRow(ctx,
 		"select "+postCols+" from posts where id = $1", id))
 }
 
@@ -93,7 +94,7 @@ func (r *Repo) Get(ctx context.Context, id string) (*Post, error) {
 // slugs both come back as pgx.ErrNoRows, so the public endpoint never
 // leaks which slugs exist as drafts.
 func (r *Repo) GetPublishedBySlug(ctx context.Context, slug string) (*Post, error) {
-	return scanPost(r.pool.QueryRow(ctx,
+	return scanPost(r.db.QueryRow(ctx,
 		"select "+postCols+" from posts where slug = $1 and status = 'published'", slug))
 }
 
@@ -106,10 +107,10 @@ func (r *Repo) uniqueSlug(ctx context.Context, base, excludeID string) (string, 
 		var exists bool
 		var err error
 		if excludeID == "" {
-			err = r.pool.QueryRow(ctx,
+			err = r.db.QueryRow(ctx,
 				"select exists(select 1 from posts where slug = $1)", slug).Scan(&exists)
 		} else {
-			err = r.pool.QueryRow(ctx,
+			err = r.db.QueryRow(ctx,
 				"select exists(select 1 from posts where slug = $1 and id != $2)", slug, excludeID).Scan(&exists)
 		}
 		if err != nil {
@@ -127,7 +128,7 @@ func (r *Repo) Insert(ctx context.Context, p *Post) (*Post, error) {
 	if err != nil {
 		return nil, err
 	}
-	return scanPost(r.pool.QueryRow(ctx,
+	return scanPost(r.db.QueryRow(ctx,
 		`insert into posts (slug, title, excerpt, content_markdown, cover_image_path)
 		 values ($1, $2, $3, $4, $5)
 		 returning `+postCols,
@@ -155,7 +156,7 @@ func (r *Repo) Update(ctx context.Context, id string, u PostUpdate) (*Post, erro
 		}
 		slug = &resolved
 	}
-	return scanPost(r.pool.QueryRow(ctx,
+	return scanPost(r.db.QueryRow(ctx,
 		`update posts set
 		   title = coalesce($2, title),
 		   excerpt = coalesce($3, excerpt),
@@ -170,7 +171,7 @@ func (r *Repo) Update(ctx context.Context, id string, u PostUpdate) (*Post, erro
 // Publish sets status to published. published_at is only set the first
 // time — an unpublish/republish cycle keeps the original publish date.
 func (r *Repo) Publish(ctx context.Context, id string) (*Post, error) {
-	return scanPost(r.pool.QueryRow(ctx,
+	return scanPost(r.db.QueryRow(ctx,
 		`update posts set
 		   status = 'published',
 		   published_at = coalesce(published_at, now()),
@@ -182,7 +183,7 @@ func (r *Repo) Publish(ctx context.Context, id string) (*Post, error) {
 
 // Unpublish sets status back to draft without touching published_at.
 func (r *Repo) Unpublish(ctx context.Context, id string) (*Post, error) {
-	return scanPost(r.pool.QueryRow(ctx,
+	return scanPost(r.db.QueryRow(ctx,
 		`update posts set
 		   status = 'draft',
 		   updated_at = now()
@@ -195,7 +196,7 @@ func (r *Repo) Unpublish(ctx context.Context, id string) (*Post, error) {
 // best-effort cleanup. Row first, storage after — same reasoning as
 // photos/tracks.
 func (r *Repo) Delete(ctx context.Context, id string) (coverPath *string, err error) {
-	err = r.pool.QueryRow(ctx,
+	err = r.db.QueryRow(ctx,
 		"delete from posts where id = $1 returning cover_image_path", id).Scan(&coverPath)
 	return coverPath, err
 }
