@@ -13,7 +13,7 @@ import (
 // (including "unset") after the test.
 func clearRequiredVars(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"SUPABASE_URL", "SUPABASE_SECRET_KEY", "DATABASE_URL", "PORT", "ADMIN_PORT", "ALLOWED_ORIGIN"} {
+	for _, k := range []string{"SUPABASE_URL", "SUPABASE_SECRET_KEY", "DATABASE_URL", "ADMIN_PORT", "ALLOWED_ORIGIN"} {
 		t.Setenv(k, "")
 	}
 }
@@ -63,9 +63,6 @@ func TestLoad_SucceedsAndDefaultsPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Port != "8080" {
-		t.Errorf("Port = %q, want default %q", cfg.Port, "8080")
-	}
 	if cfg.AdminPort != "8090" {
 		t.Errorf("AdminPort = %q, want default %q", cfg.AdminPort, "8090")
 	}
@@ -88,7 +85,7 @@ func TestLoad_TrimsTrailingSlashFromSupabaseURL(t *testing.T) {
 
 func TestLoad_DotEnvFillsInMissingVars(t *testing.T) {
 	clearRequiredVars(t)
-	chdirWithDotenv(t, "PORT=9090\nALLOWED_ORIGIN=from-dotenv\n")
+	chdirWithDotenv(t, "ADMIN_PORT=9090\nALLOWED_ORIGIN=from-dotenv\n")
 	t.Setenv("SUPABASE_URL", "https://project.supabase.co")
 	t.Setenv("SUPABASE_SECRET_KEY", "sb_secret_test")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@host/db")
@@ -97,8 +94,8 @@ func TestLoad_DotEnvFillsInMissingVars(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Port != "9090" {
-		t.Errorf("Port = %q, want %q from .env", cfg.Port, "9090")
+	if cfg.AdminPort != "9090" {
+		t.Errorf("AdminPort = %q, want %q from .env", cfg.AdminPort, "9090")
 	}
 	if cfg.AllowedOrigin != "from-dotenv" {
 		t.Errorf("AllowedOrigin = %q, want %q from .env", cfg.AllowedOrigin, "from-dotenv")

@@ -53,7 +53,7 @@ func OpenTestTx(t *testing.T) pgx.Tx {
 			poolErr = err
 			return
 		}
-		// Same fix as cmd/api/main.go: Supabase's transaction-mode pooler
+		// Same fix as cmd/admin/main.go: Supabase's transaction-mode pooler
 		// hands out different backend sessions between statements, so pgx's
 		// default cached/named prepared statements collide across them.
 		cfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec

@@ -43,9 +43,9 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Same pooler-safety note as cmd/api: QueryExecModeExec avoids named
-	// prepared statements colliding across Supabase's transaction-mode
-	// pooler's rotating backend sessions (42P05).
+	// Pooler safety: QueryExecModeExec avoids named prepared statements
+	// colliding across Supabase's transaction-mode pooler's rotating
+	// backend sessions (42P05).
 	poolConfig, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		return err
