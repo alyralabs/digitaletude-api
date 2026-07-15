@@ -33,19 +33,24 @@ func NewHandler(repo *Repo, st *storage.Client) *Handler {
 	return &Handler{repo: repo, storage: st}
 }
 
-// Register mounts the post routes. adminWrap is the auth middleware; public
-// GETs skip it entirely.
-func (h *Handler) Register(mux *http.ServeMux, adminWrap func(http.Handler) http.Handler) {
+// RegisterPublic mounts the read-only post routes.
+func (h *Handler) RegisterPublic(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/posts", h.listPublic)
 	mux.HandleFunc("GET /api/posts/{slug}", h.getBySlug)
-	mux.Handle("GET /api/admin/posts", adminWrap(http.HandlerFunc(h.listAdmin)))
-	mux.Handle("GET /api/admin/posts/{id}", adminWrap(http.HandlerFunc(h.get)))
-	mux.Handle("POST /api/admin/posts", adminWrap(http.HandlerFunc(h.create)))
-	mux.Handle("PUT /api/admin/posts/{id}", adminWrap(http.HandlerFunc(h.update)))
-	mux.Handle("PATCH /api/admin/posts/{id}/cover", adminWrap(http.HandlerFunc(h.updateCover)))
-	mux.Handle("PATCH /api/admin/posts/{id}/publish", adminWrap(http.HandlerFunc(h.publish)))
-	mux.Handle("PATCH /api/admin/posts/{id}/unpublish", adminWrap(http.HandlerFunc(h.unpublish)))
-	mux.Handle("DELETE /api/admin/posts/{id}", adminWrap(http.HandlerFunc(h.delete)))
+}
+
+// RegisterAdmin mounts the write (and admin-list/get) post routes. Only ever
+// called by the local-only admin server — never reachable from the deployed
+// public API.
+func (h *Handler) RegisterAdmin(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/admin/posts", h.listAdmin)
+	mux.HandleFunc("GET /api/admin/posts/{id}", h.get)
+	mux.HandleFunc("POST /api/admin/posts", h.create)
+	mux.HandleFunc("PUT /api/admin/posts/{id}", h.update)
+	mux.HandleFunc("PATCH /api/admin/posts/{id}/cover", h.updateCover)
+	mux.HandleFunc("PATCH /api/admin/posts/{id}/publish", h.publish)
+	mux.HandleFunc("PATCH /api/admin/posts/{id}/unpublish", h.unpublish)
+	mux.HandleFunc("DELETE /api/admin/posts/{id}", h.delete)
 }
 
 func (h *Handler) withCoverURL(p *Post) *Post {

@@ -11,8 +11,8 @@ type Config struct {
 	SupabaseURL       string
 	SupabaseSecretKey string
 	DatabaseURL       string
-	AdminUserID       string
 	Port              string
+	AdminPort         string
 	AllowedOrigin     string
 }
 
@@ -25,12 +25,15 @@ func Load() (Config, error) {
 		SupabaseURL:       strings.TrimSuffix(os.Getenv("SUPABASE_URL"), "/"),
 		SupabaseSecretKey: os.Getenv("SUPABASE_SECRET_KEY"),
 		DatabaseURL:       os.Getenv("DATABASE_URL"),
-		AdminUserID:       os.Getenv("ADMIN_USER_ID"),
 		Port:              os.Getenv("PORT"),
+		AdminPort:         os.Getenv("ADMIN_PORT"),
 		AllowedOrigin:     os.Getenv("ALLOWED_ORIGIN"),
 	}
 	if cfg.Port == "" {
 		cfg.Port = "8080"
+	}
+	if cfg.AdminPort == "" {
+		cfg.AdminPort = "8090"
 	}
 
 	var missing []string
@@ -38,7 +41,6 @@ func Load() (Config, error) {
 		"SUPABASE_URL":        cfg.SupabaseURL,
 		"SUPABASE_SECRET_KEY": cfg.SupabaseSecretKey,
 		"DATABASE_URL":        cfg.DatabaseURL,
-		"ADMIN_USER_ID":       cfg.AdminUserID,
 	} {
 		if val == "" {
 			missing = append(missing, name)

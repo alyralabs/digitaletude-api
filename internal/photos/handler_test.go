@@ -2,9 +2,6 @@ package photos
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"image"
@@ -14,23 +11,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-
-	"github.com/alyralabs/digitaletude-api/internal/auth"
 	"github.com/alyralabs/digitaletude-api/internal/storage"
 	"github.com/alyralabs/digitaletude-api/internal/testutil"
 )
 
-const testAdminID = "11111111-1111-1111-1111-111111111111"
-
 // newTestServer wires a real Handler (real repo, transaction-backed) behind
-// a real Register(mux, adminWrap) — the same auth-gating and routing code
-// that runs in production — plus an httptest-mocked storage backend so no
-// real Supabase Storage call is ever made. Returns the mux and a valid
-// admin bearer token signed against the same verifier the mux uses.
-func newTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
+// real RegisterPublic/RegisterAdmin — the same routing code that runs in
+// production — plus an httptest-mocked storage backend so no real Supabase
+// Storage call is ever made.
+func newTestServer(t *testing.T) *http.ServeMux {
 	t.Helper()
 	repo := NewRepo(testutil.OpenTestTx(t))
 
@@ -40,35 +30,18 @@ func newTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
 	t.Cleanup(storageSrv.Close)
 	st := storage.New(storageSrv.URL, "test-secret")
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kf := func(*jwt.Token) (any, error) { return &priv.PublicKey, nil }
-	verifier := auth.NewVerifierWithKeyfunc(kf, testAdminID)
-
-	claims := jwt.MapClaims{
-		"aud":  "authenticated",
-		"role": "authenticated",
-		"sub":  testAdminID,
-		"exp":  time.Now().Add(time.Hour).Unix(),
-		"iat":  time.Now().Unix(),
-	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mux = http.NewServeMux()
-	NewHandler(repo, st).Register(mux, verifier.Middleware)
-	return mux, token
+	h := NewHandler(repo, st)
+	mux := http.NewServeMux()
+	h.RegisterPublic(mux)
+	h.RegisterAdmin(mux)
+	return mux
 }
 
 // newFailingStorageTestServer is a variant of newTestServer whose mock
 // storage backend fails DELETE requests only — uploads still succeed, so a
 // test can create a photo normally and then exercise what happens when
 // storage cleanup fails on delete, without the setup step itself failing.
-func newFailingStorageTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
+func newFailingStorageTestServer(t *testing.T) *http.ServeMux {
 	t.Helper()
 	repo := NewRepo(testutil.OpenTestTx(t))
 
@@ -82,24 +55,11 @@ func newFailingStorageTestServer(t *testing.T) (mux *http.ServeMux, adminToken s
 	t.Cleanup(storageSrv.Close)
 	st := storage.New(storageSrv.URL, "test-secret")
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kf := func(*jwt.Token) (any, error) { return &priv.PublicKey, nil }
-	verifier := auth.NewVerifierWithKeyfunc(kf, testAdminID)
-	claims := jwt.MapClaims{
-		"aud": "authenticated", "role": "authenticated", "sub": testAdminID,
-		"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(),
-	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mux = http.NewServeMux()
-	NewHandler(repo, st).Register(mux, verifier.Middleware)
-	return mux, token
+	h := NewHandler(repo, st)
+	mux := http.NewServeMux()
+	h.RegisterPublic(mux)
+	h.RegisterAdmin(mux)
+	return mux
 }
 
 func testJPEG(t *testing.T) []byte {
@@ -186,54 +146,30 @@ func multipartUploadBody(t *testing.T, title, description string, fileBytes []by
 	return buf, w.FormDataContentType()
 }
 
-func TestHandler_PublicRoutesRequireNoAuth(t *testing.T) {
-	mux, _ := newTestServer(t)
+func TestHandler_PublicRoutes(t *testing.T) {
+	mux := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/photos", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Errorf("GET /api/photos (no token) status = %d, want 200", rec.Code)
+		t.Errorf("GET /api/photos status = %d, want 200", rec.Code)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/photos/00000000-0000-0000-0000-000000000000", nil)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
-		t.Errorf("GET /api/photos/{unknown-id} (no token) status = %d, want 404 (not 401 — route must stay public)", rec.Code)
-	}
-}
-
-func TestHandler_AdminRoutesRejectMissingToken(t *testing.T) {
-	mux, _ := newTestServer(t)
-
-	cases := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodPost, "/api/admin/photos"},
-		{http.MethodPatch, "/api/admin/photos/00000000-0000-0000-0000-000000000000"},
-		{http.MethodDelete, "/api/admin/photos/00000000-0000-0000-0000-000000000000"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.method, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, tc.path, nil)
-			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, req)
-			if rec.Code != http.StatusUnauthorized {
-				t.Errorf("%s %s (no token) status = %d, want 401", tc.method, tc.path, rec.Code)
-			}
-		})
+		t.Errorf("GET /api/photos/{unknown-id} status = %d, want 404", rec.Code)
 	}
 }
 
 func TestHandler_Create_RejectsNonImage(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartUploadBody(t, "Bad Upload", "", []byte("this is not an image at all"))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/photos", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -243,13 +179,12 @@ func TestHandler_Create_RejectsNonImage(t *testing.T) {
 }
 
 func TestHandler_Create_RejectsOversizedBody(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	oversized := bytes.Repeat([]byte{0}, 16<<20) // 16 MiB, over the 15 MiB cap
 	body, contentType := multipartUploadBody(t, "Too Big", "", oversized)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/photos", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -259,12 +194,11 @@ func TestHandler_Create_RejectsOversizedBody(t *testing.T) {
 }
 
 func TestHandler_Create_Success(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartUploadBody(t, "A Real Photo", "a description", testJPEG(t))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/photos", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -288,12 +222,11 @@ func TestHandler_Create_Success(t *testing.T) {
 }
 
 func TestHandler_Create_ExtractsAndStoresExif(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartUploadBody(t, "Has Exif", "", isoJPEG(t, 100, 80, 400))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/photos", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -334,12 +267,11 @@ func TestHandler_Create_ExtractsAndStoresExif(t *testing.T) {
 }
 
 func TestHandler_Delete_RemovesRowEvenIfStorageCleanupFails(t *testing.T) {
-	mux, token := newFailingStorageTestServer(t)
+	mux := newFailingStorageTestServer(t)
 	body, contentType := multipartUploadBody(t, "Will Be Deleted", "", testJPEG(t))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/photos", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -351,7 +283,6 @@ func TestHandler_Delete_RemovesRowEvenIfStorageCleanupFails(t *testing.T) {
 	}
 
 	delReq := httptest.NewRequest(http.MethodDelete, "/api/admin/photos/"+created.ID, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
 	delRec := httptest.NewRecorder()
 	mux.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusNoContent {
@@ -367,14 +298,13 @@ func TestHandler_Delete_RemovesRowEvenIfStorageCleanupFails(t *testing.T) {
 }
 
 func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	unknownID := "00000000-0000-0000-0000-000000000000"
 
 	newTitle := "won't apply"
 	patchBody, _ := json.Marshal(PhotoUpdate{Title: &newTitle})
 	patchReq := httptest.NewRequest(http.MethodPatch, "/api/admin/photos/"+unknownID, bytes.NewReader(patchBody))
 	patchReq.Header.Set("Content-Type", "application/json")
-	patchReq.Header.Set("Authorization", "Bearer "+token)
 	patchRec := httptest.NewRecorder()
 	mux.ServeHTTP(patchRec, patchReq)
 	if patchRec.Code != http.StatusNotFound {
@@ -382,7 +312,6 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 	}
 
 	delReq := httptest.NewRequest(http.MethodDelete, "/api/admin/photos/"+unknownID, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
 	delRec := httptest.NewRecorder()
 	mux.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusNotFound {

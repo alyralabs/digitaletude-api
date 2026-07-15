@@ -2,9 +2,6 @@ package posts
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -13,23 +10,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-
-	"github.com/alyralabs/digitaletude-api/internal/auth"
 	"github.com/alyralabs/digitaletude-api/internal/storage"
 	"github.com/alyralabs/digitaletude-api/internal/testutil"
 )
 
-const testAdminID = "11111111-1111-1111-1111-111111111111"
-
 // newTestServer wires a real Handler (real repo, transaction-backed) behind
-// a real Register(mux, adminWrap) — the same auth-gating and routing code
-// that runs in production — plus an httptest-mocked storage backend so no
-// real Supabase Storage call is ever made. Returns the mux and a valid
-// admin bearer token signed against the same verifier the mux uses.
-func newTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
+// real RegisterPublic/RegisterAdmin — the same routing code that runs in
+// production — plus an httptest-mocked storage backend so no real Supabase
+// Storage call is ever made.
+func newTestServer(t *testing.T) *http.ServeMux {
 	t.Helper()
 	repo := NewRepo(testutil.OpenTestTx(t))
 
@@ -39,28 +29,11 @@ func newTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
 	t.Cleanup(storageSrv.Close)
 	st := storage.New(storageSrv.URL, "test-secret")
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kf := func(*jwt.Token) (any, error) { return &priv.PublicKey, nil }
-	verifier := auth.NewVerifierWithKeyfunc(kf, testAdminID)
-
-	claims := jwt.MapClaims{
-		"aud":  "authenticated",
-		"role": "authenticated",
-		"sub":  testAdminID,
-		"exp":  time.Now().Add(time.Hour).Unix(),
-		"iat":  time.Now().Unix(),
-	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mux = http.NewServeMux()
-	NewHandler(repo, st).Register(mux, verifier.Middleware)
-	return mux, token
+	h := NewHandler(repo, st)
+	mux := http.NewServeMux()
+	h.RegisterPublic(mux)
+	h.RegisterAdmin(mux)
+	return mux
 }
 
 // newFailingStorageTestServer is a variant of newTestServer whose mock
@@ -68,7 +41,7 @@ func newTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
 // test can create a post (with a cover) normally and then exercise what
 // happens when storage cleanup of the old cover fails on replace, without
 // the setup step itself failing.
-func newFailingStorageTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
+func newFailingStorageTestServer(t *testing.T) *http.ServeMux {
 	t.Helper()
 	repo := NewRepo(testutil.OpenTestTx(t))
 
@@ -82,24 +55,11 @@ func newFailingStorageTestServer(t *testing.T) (mux *http.ServeMux, adminToken s
 	t.Cleanup(storageSrv.Close)
 	st := storage.New(storageSrv.URL, "test-secret")
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kf := func(*jwt.Token) (any, error) { return &priv.PublicKey, nil }
-	verifier := auth.NewVerifierWithKeyfunc(kf, testAdminID)
-	claims := jwt.MapClaims{
-		"aud": "authenticated", "role": "authenticated", "sub": testAdminID,
-		"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(),
-	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mux = http.NewServeMux()
-	NewHandler(repo, st).Register(mux, verifier.Middleware)
-	return mux, token
+	h := NewHandler(repo, st)
+	mux := http.NewServeMux()
+	h.RegisterPublic(mux)
+	h.RegisterAdmin(mux)
+	return mux
 }
 
 func multipartPostBody(t *testing.T, fields map[string]string) (*bytes.Buffer, string) {
@@ -117,12 +77,11 @@ func multipartPostBody(t *testing.T, fields map[string]string) (*bytes.Buffer, s
 	return buf, w.FormDataContentType()
 }
 
-func createTestPost(t *testing.T, mux *http.ServeMux, token string, fields map[string]string) Post {
+func createTestPost(t *testing.T, mux *http.ServeMux, fields map[string]string) Post {
 	t.Helper()
 	body, contentType := multipartPostBody(t, fields)
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/posts", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -135,55 +94,27 @@ func createTestPost(t *testing.T, mux *http.ServeMux, token string, fields map[s
 	return p
 }
 
-func TestHandler_PublicRoutesRequireNoAuth(t *testing.T) {
-	mux, _ := newTestServer(t)
+func TestHandler_PublicRoutes(t *testing.T) {
+	mux := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/posts", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Errorf("GET /api/posts (no token) status = %d, want 200", rec.Code)
+		t.Errorf("GET /api/posts status = %d, want 200", rec.Code)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/posts/unknown-slug", nil)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
-		t.Errorf("GET /api/posts/{unknown-slug} (no token) status = %d, want 404 (not 401 — route must stay public)", rec.Code)
-	}
-}
-
-func TestHandler_AdminRoutesRejectMissingToken(t *testing.T) {
-	mux, _ := newTestServer(t)
-	unknownID := "00000000-0000-0000-0000-000000000000"
-
-	cases := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/api/admin/posts"},
-		{http.MethodGet, "/api/admin/posts/" + unknownID},
-		{http.MethodPost, "/api/admin/posts"},
-		{http.MethodPut, "/api/admin/posts/" + unknownID},
-		{http.MethodPatch, "/api/admin/posts/" + unknownID + "/publish"},
-		{http.MethodPatch, "/api/admin/posts/" + unknownID + "/unpublish"},
-		{http.MethodDelete, "/api/admin/posts/" + unknownID},
-	}
-	for _, tc := range cases {
-		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, tc.path, nil)
-			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, req)
-			if rec.Code != http.StatusUnauthorized {
-				t.Errorf("%s %s (no token) status = %d, want 401", tc.method, tc.path, rec.Code)
-			}
-		})
+		t.Errorf("GET /api/posts/{unknown-slug} status = %d, want 404", rec.Code)
 	}
 }
 
 func TestHandler_Create_Success(t *testing.T) {
-	mux, token := newTestServer(t)
-	created := createTestPost(t, mux, token, map[string]string{
+	mux := newTestServer(t)
+	created := createTestPost(t, mux, map[string]string{
 		"title":           "A Real Post",
 		"excerpt":         "a hand-written excerpt",
 		"contentMarkdown": "# Heading\n\nsome body text.",
@@ -201,18 +132,17 @@ func TestHandler_Create_Success(t *testing.T) {
 }
 
 func TestHandler_ListPublic_ExcludesDraftsAndDerivesExcerpt(t *testing.T) {
-	mux, token := newTestServer(t)
-	draft := createTestPost(t, mux, token, map[string]string{
+	mux := newTestServer(t)
+	draft := createTestPost(t, mux, map[string]string{
 		"title":           "A Draft",
 		"contentMarkdown": "draft body",
 	})
-	published := createTestPost(t, mux, token, map[string]string{
+	published := createTestPost(t, mux, map[string]string{
 		"title":           "A Published Post",
 		"contentMarkdown": "# Heading\n\nThis body has no explicit excerpt set.",
 	})
 
 	pubReq := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+published.ID+"/publish", nil)
-	pubReq.Header.Set("Authorization", "Bearer "+token)
 	pubRec := httptest.NewRecorder()
 	mux.ServeHTTP(pubRec, pubReq)
 	if pubRec.Code != http.StatusOK {
@@ -256,8 +186,8 @@ func TestHandler_ListPublic_ExcludesDraftsAndDerivesExcerpt(t *testing.T) {
 }
 
 func TestHandler_GetBySlug_HidesDraftsAsNotFound(t *testing.T) {
-	mux, token := newTestServer(t)
-	draft := createTestPost(t, mux, token, map[string]string{
+	mux := newTestServer(t)
+	draft := createTestPost(t, mux, map[string]string{
 		"title":           "Hidden Draft",
 		"contentMarkdown": "body",
 	})
@@ -270,7 +200,6 @@ func TestHandler_GetBySlug_HidesDraftsAsNotFound(t *testing.T) {
 	}
 
 	pubReq := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+draft.ID+"/publish", nil)
-	pubReq.Header.Set("Authorization", "Bearer "+token)
 	pubRec := httptest.NewRecorder()
 	mux.ServeHTTP(pubRec, pubReq)
 	if pubRec.Code != http.StatusOK {
@@ -286,14 +215,13 @@ func TestHandler_GetBySlug_HidesDraftsAsNotFound(t *testing.T) {
 }
 
 func TestHandler_ListAdmin_IncludesDraftsAndFullFields(t *testing.T) {
-	mux, token := newTestServer(t)
-	createTestPost(t, mux, token, map[string]string{
+	mux := newTestServer(t)
+	createTestPost(t, mux, map[string]string{
 		"title":           "Admin Visible Draft",
 		"contentMarkdown": "secret draft body",
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/admin/posts", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -319,14 +247,13 @@ func TestHandler_ListAdmin_IncludesDraftsAndFullFields(t *testing.T) {
 }
 
 func TestHandler_PublishUnpublish_RoundTrip(t *testing.T) {
-	mux, token := newTestServer(t)
-	created := createTestPost(t, mux, token, map[string]string{
+	mux := newTestServer(t)
+	created := createTestPost(t, mux, map[string]string{
 		"title":           "Publish Cycle Post",
 		"contentMarkdown": "body",
 	})
 
 	pubReq := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+created.ID+"/publish", nil)
-	pubReq.Header.Set("Authorization", "Bearer "+token)
 	pubRec := httptest.NewRecorder()
 	mux.ServeHTTP(pubRec, pubReq)
 	if pubRec.Code != http.StatusOK {
@@ -341,7 +268,6 @@ func TestHandler_PublishUnpublish_RoundTrip(t *testing.T) {
 	}
 
 	unpubReq := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+created.ID+"/unpublish", nil)
-	unpubReq.Header.Set("Authorization", "Bearer "+token)
 	unpubRec := httptest.NewRecorder()
 	mux.ServeHTTP(unpubRec, unpubReq)
 	if unpubRec.Code != http.StatusOK {
@@ -357,14 +283,13 @@ func TestHandler_PublishUnpublish_RoundTrip(t *testing.T) {
 }
 
 func TestHandler_Update_SlugFrozenOncePublished(t *testing.T) {
-	mux, token := newTestServer(t)
-	created := createTestPost(t, mux, token, map[string]string{
+	mux := newTestServer(t)
+	created := createTestPost(t, mux, map[string]string{
 		"title":           "Freeze Me Via Handler",
 		"contentMarkdown": "body",
 	})
 
 	pubReq := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+created.ID+"/publish", nil)
-	pubReq.Header.Set("Authorization", "Bearer "+token)
 	pubRec := httptest.NewRecorder()
 	mux.ServeHTTP(pubRec, pubReq)
 	if pubRec.Code != http.StatusOK {
@@ -375,7 +300,6 @@ func TestHandler_Update_SlugFrozenOncePublished(t *testing.T) {
 	patchBody, _ := json.Marshal(PostUpdate{Slug: &newSlug})
 	putReq := httptest.NewRequest(http.MethodPut, "/api/admin/posts/"+created.ID, bytes.NewReader(patchBody))
 	putReq.Header.Set("Content-Type", "application/json")
-	putReq.Header.Set("Authorization", "Bearer "+token)
 	putRec := httptest.NewRecorder()
 	mux.ServeHTTP(putRec, putReq)
 	if putRec.Code != http.StatusOK {
@@ -391,14 +315,13 @@ func TestHandler_Update_SlugFrozenOncePublished(t *testing.T) {
 }
 
 func TestHandler_Delete_RemovesPost(t *testing.T) {
-	mux, token := newTestServer(t)
-	created := createTestPost(t, mux, token, map[string]string{
+	mux := newTestServer(t)
+	created := createTestPost(t, mux, map[string]string{
 		"title":           "Will Be Deleted",
 		"contentMarkdown": "body",
 	})
 
 	delReq := httptest.NewRequest(http.MethodDelete, "/api/admin/posts/"+created.ID, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
 	delRec := httptest.NewRecorder()
 	mux.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusNoContent {
@@ -406,7 +329,6 @@ func TestHandler_Delete_RemovesPost(t *testing.T) {
 	}
 
 	getReq := httptest.NewRequest(http.MethodGet, "/api/admin/posts/"+created.ID, nil)
-	getReq.Header.Set("Authorization", "Bearer "+token)
 	getRec := httptest.NewRecorder()
 	mux.ServeHTTP(getRec, getReq)
 	if getRec.Code != http.StatusNotFound {
@@ -415,11 +337,10 @@ func TestHandler_Delete_RemovesPost(t *testing.T) {
 }
 
 func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	unknownID := "00000000-0000-0000-0000-000000000000"
 
 	getReq := httptest.NewRequest(http.MethodGet, "/api/admin/posts/"+unknownID, nil)
-	getReq.Header.Set("Authorization", "Bearer "+token)
 	getRec := httptest.NewRecorder()
 	mux.ServeHTTP(getRec, getReq)
 	if getRec.Code != http.StatusNotFound {
@@ -430,7 +351,6 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 	putBody, _ := json.Marshal(PostUpdate{Title: &newTitle})
 	putReq := httptest.NewRequest(http.MethodPut, "/api/admin/posts/"+unknownID, bytes.NewReader(putBody))
 	putReq.Header.Set("Content-Type", "application/json")
-	putReq.Header.Set("Authorization", "Bearer "+token)
 	putRec := httptest.NewRecorder()
 	mux.ServeHTTP(putRec, putReq)
 	if putRec.Code != http.StatusNotFound {
@@ -438,7 +358,6 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 	}
 
 	pubReq := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+unknownID+"/publish", nil)
-	pubReq.Header.Set("Authorization", "Bearer "+token)
 	pubRec := httptest.NewRecorder()
 	mux.ServeHTTP(pubRec, pubReq)
 	if pubRec.Code != http.StatusNotFound {
@@ -446,7 +365,6 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 	}
 
 	delReq := httptest.NewRequest(http.MethodDelete, "/api/admin/posts/"+unknownID, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
 	delRec := httptest.NewRecorder()
 	mux.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusNotFound {
@@ -487,8 +405,8 @@ func multipartCoverBody(t *testing.T, fileBytes []byte) (*bytes.Buffer, string) 
 }
 
 func TestHandler_UpdateCover_AddsCoverToPostThatHadNone(t *testing.T) {
-	mux, token := newTestServer(t)
-	created := createTestPost(t, mux, token, map[string]string{
+	mux := newTestServer(t)
+	created := createTestPost(t, mux, map[string]string{
 		"title":           "No Cover Yet",
 		"contentMarkdown": "body",
 	})
@@ -499,7 +417,6 @@ func TestHandler_UpdateCover_AddsCoverToPostThatHadNone(t *testing.T) {
 	body, contentType := multipartCoverBody(t, testJPEG(t))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+created.ID+"/cover", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -516,7 +433,7 @@ func TestHandler_UpdateCover_AddsCoverToPostThatHadNone(t *testing.T) {
 }
 
 func TestHandler_UpdateCover_ReplacesExistingCoverAndCleansUpOld(t *testing.T) {
-	mux, token := newFailingStorageTestServer(t)
+	mux := newFailingStorageTestServer(t)
 
 	// Build the create request directly so it includes a real cover file
 	// (createTestPost/multipartPostBody only handle text fields).
@@ -536,7 +453,6 @@ func TestHandler_UpdateCover_ReplacesExistingCoverAndCleansUpOld(t *testing.T) {
 	}
 	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/posts", buf)
 	createReq.Header.Set("Content-Type", w.FormDataContentType())
-	createReq.Header.Set("Authorization", "Bearer "+token)
 	createRec := httptest.NewRecorder()
 	mux.ServeHTTP(createRec, createReq)
 	if createRec.Code != http.StatusCreated {
@@ -554,7 +470,6 @@ func TestHandler_UpdateCover_ReplacesExistingCoverAndCleansUpOld(t *testing.T) {
 	body, contentType := multipartCoverBody(t, testJPEG(t))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+withCover.ID+"/cover", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -574,8 +489,8 @@ func TestHandler_UpdateCover_ReplacesExistingCoverAndCleansUpOld(t *testing.T) {
 }
 
 func TestHandler_UpdateCover_RejectsNonImage(t *testing.T) {
-	mux, token := newTestServer(t)
-	created := createTestPost(t, mux, token, map[string]string{
+	mux := newTestServer(t)
+	created := createTestPost(t, mux, map[string]string{
 		"title":           "Bad Cover Target",
 		"contentMarkdown": "body",
 	})
@@ -583,7 +498,6 @@ func TestHandler_UpdateCover_RejectsNonImage(t *testing.T) {
 	body, contentType := multipartCoverBody(t, []byte("not an image"))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+created.ID+"/cover", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -593,32 +507,16 @@ func TestHandler_UpdateCover_RejectsNonImage(t *testing.T) {
 }
 
 func TestHandler_UpdateCover_UnknownIDReturns404(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	unknownID := "00000000-0000-0000-0000-000000000000"
 
 	body, contentType := multipartCoverBody(t, testJPEG(t))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+unknownID+"/cover", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
-	}
-}
-
-func TestHandler_UpdateCover_RequiresAuth(t *testing.T) {
-	mux, _ := newTestServer(t)
-	unknownID := "00000000-0000-0000-0000-000000000000"
-
-	body, contentType := multipartCoverBody(t, testJPEG(t))
-	req := httptest.NewRequest(http.MethodPatch, "/api/admin/posts/"+unknownID+"/cover", body)
-	req.Header.Set("Content-Type", contentType)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want 401", rec.Code)
 	}
 }

@@ -30,14 +30,18 @@ func NewHandler(repo *Repo, st *storage.Client) *Handler {
 	return &Handler{repo: repo, storage: st}
 }
 
-// Register mounts the photo routes. adminWrap is the auth middleware; public
-// GETs skip it entirely.
-func (h *Handler) Register(mux *http.ServeMux, adminWrap func(http.Handler) http.Handler) {
+// RegisterPublic mounts the read-only photo routes.
+func (h *Handler) RegisterPublic(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/photos", h.list)
 	mux.HandleFunc("GET /api/photos/{id}", h.get)
-	mux.Handle("POST /api/admin/photos", adminWrap(http.HandlerFunc(h.create)))
-	mux.Handle("PATCH /api/admin/photos/{id}", adminWrap(http.HandlerFunc(h.update)))
-	mux.Handle("DELETE /api/admin/photos/{id}", adminWrap(http.HandlerFunc(h.delete)))
+}
+
+// RegisterAdmin mounts the write photo routes. Only ever called by the
+// local-only admin server — never reachable from the deployed public API.
+func (h *Handler) RegisterAdmin(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/admin/photos", h.create)
+	mux.HandleFunc("PATCH /api/admin/photos/{id}", h.update)
+	mux.HandleFunc("DELETE /api/admin/photos/{id}", h.delete)
 }
 
 func (h *Handler) withURLs(p *Photo) *Photo {

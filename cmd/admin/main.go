@@ -1,3 +1,8 @@
+// Command admin runs the local-only admin API: the write endpoints for
+// photos, music, and posts, with no auth. It only ever binds 127.0.0.1 and
+// is never deployed — the owner runs it locally, pointed (via a local .env)
+// at the same production Supabase Postgres/Storage the public site reads
+// from, and drives it with the separate digitaletude-admin frontend.
 package main
 
 import (
@@ -38,10 +43,9 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Supabase's transaction-mode pooler hands out different backend
-	// sessions between statements, so pgx's default named/cached prepared
-	// statements collide across them (42P05). QueryExecModeExec keeps the
-	// extended (type-safe) protocol but never names or caches a statement.
+	// Same pooler-safety note as cmd/api: QueryExecModeExec avoids named
+	// prepared statements colliding across Supabase's transaction-mode
+	// pooler's rotating backend sessions (42P05).
 	poolConfig, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		return err
@@ -64,20 +68,31 @@ func run() error {
 		httpserver.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	photos.NewHandler(photos.NewRepo(pool), st).RegisterPublic(mux)
-	music.NewHandler(music.NewRepo(pool), st).RegisterPublic(mux)
-	posts.NewHandler(posts.NewRepo(pool), st).RegisterPublic(mux)
+	// Photos and music have no draft/published split — the "admin" pages for
+	// them list everything via the same read routes the public site uses, so
+	// this server registers both. Posts' admin list/get are already separate
+	// admin-only routes (they include drafts), so no public registration is
+	// needed there.
+	photosHandler := photos.NewHandler(photos.NewRepo(pool), st)
+	photosHandler.RegisterPublic(mux)
+	photosHandler.RegisterAdmin(mux)
+
+	musicHandler := music.NewHandler(music.NewRepo(pool), st)
+	musicHandler.RegisterPublic(mux)
+	musicHandler.RegisterAdmin(mux)
+
+	posts.NewHandler(posts.NewRepo(pool), st).RegisterAdmin(mux)
 
 	handler := httpserver.Recover(httpserver.Log(httpserver.CORS(cfg.AllowedOrigin)(mux)))
 	srv := &http.Server{
-		Addr:              ":" + cfg.Port,
+		Addr:              "127.0.0.1:" + cfg.AdminPort,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("listening", "port", cfg.Port)
+		slog.Info("admin server listening", "addr", srv.Addr)
 		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -89,7 +104,6 @@ func run() error {
 	case <-ctx.Done():
 	}
 
-	// Drain in-flight requests (uploads especially) before exiting.
 	slog.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

@@ -37,18 +37,22 @@ func NewHandler(repo *Repo, st *storage.Client) *Handler {
 	return &Handler{repo: repo, storage: st}
 }
 
-// Register mounts the music routes. adminWrap is the auth middleware; the
-// public GET skips it entirely.
-func (h *Handler) Register(mux *http.ServeMux, adminWrap func(http.Handler) http.Handler) {
+// RegisterPublic mounts the read-only music route.
+func (h *Handler) RegisterPublic(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/music", h.listMusic)
-	mux.Handle("POST /api/admin/albums", adminWrap(http.HandlerFunc(h.createAlbum)))
-	mux.Handle("PATCH /api/admin/albums/{id}", adminWrap(http.HandlerFunc(h.updateAlbum)))
-	mux.Handle("PATCH /api/admin/albums/{id}/cover", adminWrap(http.HandlerFunc(h.updateAlbumCover)))
-	mux.Handle("DELETE /api/admin/albums/{id}", adminWrap(http.HandlerFunc(h.deleteAlbum)))
-	mux.Handle("POST /api/admin/tracks", adminWrap(http.HandlerFunc(h.createTrack)))
-	mux.Handle("PATCH /api/admin/tracks/{id}", adminWrap(http.HandlerFunc(h.updateTrack)))
-	mux.Handle("PATCH /api/admin/tracks/{id}/cover", adminWrap(http.HandlerFunc(h.updateTrackCover)))
-	mux.Handle("DELETE /api/admin/tracks/{id}", adminWrap(http.HandlerFunc(h.deleteTrack)))
+}
+
+// RegisterAdmin mounts the write music routes. Only ever called by the
+// local-only admin server — never reachable from the deployed public API.
+func (h *Handler) RegisterAdmin(mux *http.ServeMux) {
+	mux.HandleFunc("POST /api/admin/albums", h.createAlbum)
+	mux.HandleFunc("PATCH /api/admin/albums/{id}", h.updateAlbum)
+	mux.HandleFunc("PATCH /api/admin/albums/{id}/cover", h.updateAlbumCover)
+	mux.HandleFunc("DELETE /api/admin/albums/{id}", h.deleteAlbum)
+	mux.HandleFunc("POST /api/admin/tracks", h.createTrack)
+	mux.HandleFunc("PATCH /api/admin/tracks/{id}", h.updateTrack)
+	mux.HandleFunc("PATCH /api/admin/tracks/{id}/cover", h.updateTrackCover)
+	mux.HandleFunc("DELETE /api/admin/tracks/{id}", h.deleteTrack)
 }
 
 func (h *Handler) withAlbumCoverURL(a *Album) *Album {

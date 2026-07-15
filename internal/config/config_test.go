@@ -13,7 +13,7 @@ import (
 // (including "unset") after the test.
 func clearRequiredVars(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"SUPABASE_URL", "SUPABASE_SECRET_KEY", "DATABASE_URL", "ADMIN_USER_ID", "PORT", "ALLOWED_ORIGIN"} {
+	for _, k := range []string{"SUPABASE_URL", "SUPABASE_SECRET_KEY", "DATABASE_URL", "PORT", "ADMIN_PORT", "ALLOWED_ORIGIN"} {
 		t.Setenv(k, "")
 	}
 }
@@ -37,7 +37,6 @@ func setRequiredVars(t *testing.T) {
 	t.Setenv("SUPABASE_URL", "https://project.supabase.co")
 	t.Setenv("SUPABASE_SECRET_KEY", "sb_secret_test")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@host/db")
-	t.Setenv("ADMIN_USER_ID", "11111111-1111-1111-1111-111111111111")
 }
 
 func TestLoad_FailsFastOnMissingRequiredVars(t *testing.T) {
@@ -48,7 +47,7 @@ func TestLoad_FailsFastOnMissingRequiredVars(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load() error = nil, want error for missing required vars")
 	}
-	for _, want := range []string{"SUPABASE_URL", "SUPABASE_SECRET_KEY", "DATABASE_URL", "ADMIN_USER_ID"} {
+	for _, want := range []string{"SUPABASE_URL", "SUPABASE_SECRET_KEY", "DATABASE_URL"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Load() error = %q, want it to mention missing var %q", err.Error(), want)
 		}
@@ -66,6 +65,9 @@ func TestLoad_SucceedsAndDefaultsPort(t *testing.T) {
 	}
 	if cfg.Port != "8080" {
 		t.Errorf("Port = %q, want default %q", cfg.Port, "8080")
+	}
+	if cfg.AdminPort != "8090" {
+		t.Errorf("AdminPort = %q, want default %q", cfg.AdminPort, "8090")
 	}
 }
 
@@ -86,7 +88,7 @@ func TestLoad_TrimsTrailingSlashFromSupabaseURL(t *testing.T) {
 
 func TestLoad_DotEnvFillsInMissingVars(t *testing.T) {
 	clearRequiredVars(t)
-	chdirWithDotenv(t, "PORT=9090\nADMIN_USER_ID=from-dotenv\n")
+	chdirWithDotenv(t, "PORT=9090\nALLOWED_ORIGIN=from-dotenv\n")
 	t.Setenv("SUPABASE_URL", "https://project.supabase.co")
 	t.Setenv("SUPABASE_SECRET_KEY", "sb_secret_test")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@host/db")
@@ -98,53 +100,53 @@ func TestLoad_DotEnvFillsInMissingVars(t *testing.T) {
 	if cfg.Port != "9090" {
 		t.Errorf("Port = %q, want %q from .env", cfg.Port, "9090")
 	}
-	if cfg.AdminUserID != "from-dotenv" {
-		t.Errorf("AdminUserID = %q, want %q from .env", cfg.AdminUserID, "from-dotenv")
+	if cfg.AllowedOrigin != "from-dotenv" {
+		t.Errorf("AllowedOrigin = %q, want %q from .env", cfg.AllowedOrigin, "from-dotenv")
 	}
 }
 
 func TestLoad_RealEnvWinsOverDotEnv(t *testing.T) {
 	clearRequiredVars(t)
-	chdirWithDotenv(t, "ADMIN_USER_ID=from-dotenv\n")
+	chdirWithDotenv(t, "ALLOWED_ORIGIN=from-dotenv\n")
 	setRequiredVars(t)
-	t.Setenv("ADMIN_USER_ID", "from-real-env")
+	t.Setenv("ALLOWED_ORIGIN", "from-real-env")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.AdminUserID != "from-real-env" {
-		t.Errorf("AdminUserID = %q, want real env value %q to win over .env", cfg.AdminUserID, "from-real-env")
+	if cfg.AllowedOrigin != "from-real-env" {
+		t.Errorf("AllowedOrigin = %q, want real env value %q to win over .env", cfg.AllowedOrigin, "from-real-env")
 	}
 }
 
 func TestLoad_DotEnvValuesAreQuoteTrimmed(t *testing.T) {
 	clearRequiredVars(t)
-	chdirWithDotenv(t, `ADMIN_USER_ID="quoted-value"`+"\n")
+	chdirWithDotenv(t, `ALLOWED_ORIGIN="quoted-value"`+"\n")
 	setRequiredVars(t)
-	t.Setenv("ADMIN_USER_ID", "")
+	t.Setenv("ALLOWED_ORIGIN", "")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.AdminUserID != "quoted-value" {
-		t.Errorf("AdminUserID = %q, want surrounding quotes trimmed to %q", cfg.AdminUserID, "quoted-value")
+	if cfg.AllowedOrigin != "quoted-value" {
+		t.Errorf("AllowedOrigin = %q, want surrounding quotes trimmed to %q", cfg.AllowedOrigin, "quoted-value")
 	}
 }
 
 func TestLoad_DotEnvIgnoresCommentsAndBlankLines(t *testing.T) {
 	clearRequiredVars(t)
-	chdirWithDotenv(t, "# a comment\n\nADMIN_USER_ID=from-dotenv\n")
+	chdirWithDotenv(t, "# a comment\n\nALLOWED_ORIGIN=from-dotenv\n")
 	setRequiredVars(t)
-	t.Setenv("ADMIN_USER_ID", "")
+	t.Setenv("ALLOWED_ORIGIN", "")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.AdminUserID != "from-dotenv" {
-		t.Errorf("AdminUserID = %q, want %q (comments/blank lines skipped, not misparsed)", cfg.AdminUserID, "from-dotenv")
+	if cfg.AllowedOrigin != "from-dotenv" {
+		t.Errorf("AllowedOrigin = %q, want %q (comments/blank lines skipped, not misparsed)", cfg.AllowedOrigin, "from-dotenv")
 	}
 }
 

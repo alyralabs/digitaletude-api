@@ -2,9 +2,6 @@ package music
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"encoding/json"
 	"image"
 	"image/color"
@@ -13,23 +10,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-
-	"github.com/alyralabs/digitaletude-api/internal/auth"
 	"github.com/alyralabs/digitaletude-api/internal/storage"
 	"github.com/alyralabs/digitaletude-api/internal/testutil"
 )
 
-const testAdminID = "11111111-1111-1111-1111-111111111111"
-
 // newTestServer wires a real Handler (real repo, transaction-backed) behind
-// a real Register(mux, adminWrap) — the same auth-gating and routing code
-// that runs in production — plus an httptest-mocked storage backend so no
-// real Supabase Storage call is ever made. Returns the mux and a valid
-// admin bearer token signed against the same verifier the mux uses.
-func newTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
+// real RegisterPublic/RegisterAdmin — the same routing code that runs in
+// production — plus an httptest-mocked storage backend so no real Supabase
+// Storage call is ever made.
+func newTestServer(t *testing.T) *http.ServeMux {
 	t.Helper()
 	repo := NewRepo(testutil.OpenTestTx(t))
 
@@ -39,28 +29,11 @@ func newTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
 	t.Cleanup(storageSrv.Close)
 	st := storage.New(storageSrv.URL, "test-secret")
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kf := func(*jwt.Token) (any, error) { return &priv.PublicKey, nil }
-	verifier := auth.NewVerifierWithKeyfunc(kf, testAdminID)
-
-	claims := jwt.MapClaims{
-		"aud":  "authenticated",
-		"role": "authenticated",
-		"sub":  testAdminID,
-		"exp":  time.Now().Add(time.Hour).Unix(),
-		"iat":  time.Now().Unix(),
-	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mux = http.NewServeMux()
-	NewHandler(repo, st).Register(mux, verifier.Middleware)
-	return mux, token
+	h := NewHandler(repo, st)
+	mux := http.NewServeMux()
+	h.RegisterPublic(mux)
+	h.RegisterAdmin(mux)
+	return mux
 }
 
 // newFailingStorageTestServer is a variant of newTestServer whose mock
@@ -68,7 +41,7 @@ func newTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
 // test can create a track/album normally and then exercise what happens
 // when storage cleanup fails on delete, without the setup step itself
 // failing.
-func newFailingStorageTestServer(t *testing.T) (mux *http.ServeMux, adminToken string) {
+func newFailingStorageTestServer(t *testing.T) *http.ServeMux {
 	t.Helper()
 	repo := NewRepo(testutil.OpenTestTx(t))
 
@@ -82,24 +55,11 @@ func newFailingStorageTestServer(t *testing.T) (mux *http.ServeMux, adminToken s
 	t.Cleanup(storageSrv.Close)
 	st := storage.New(storageSrv.URL, "test-secret")
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kf := func(*jwt.Token) (any, error) { return &priv.PublicKey, nil }
-	verifier := auth.NewVerifierWithKeyfunc(kf, testAdminID)
-	claims := jwt.MapClaims{
-		"aud": "authenticated", "role": "authenticated", "sub": testAdminID,
-		"exp": time.Now().Add(time.Hour).Unix(), "iat": time.Now().Unix(),
-	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodES256, claims).SignedString(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mux = http.NewServeMux()
-	NewHandler(repo, st).Register(mux, verifier.Middleware)
-	return mux, token
+	h := NewHandler(repo, st)
+	mux := http.NewServeMux()
+	h.RegisterPublic(mux)
+	h.RegisterAdmin(mux)
+	return mux
 }
 
 // testMP3 returns bytes that pass isMP3's ID3v2-header check. Not a decodable
@@ -181,51 +141,23 @@ func multipartCoverBody(t *testing.T, fileBytes []byte) (*bytes.Buffer, string) 
 	return buf, w.FormDataContentType()
 }
 
-func TestHandler_PublicRouteRequiresNoAuth(t *testing.T) {
-	mux, _ := newTestServer(t)
+func TestHandler_PublicRoute(t *testing.T) {
+	mux := newTestServer(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/music", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Errorf("GET /api/music (no token) status = %d, want 200", rec.Code)
-	}
-}
-
-func TestHandler_AdminRoutesRejectMissingToken(t *testing.T) {
-	mux, _ := newTestServer(t)
-	unknownID := "00000000-0000-0000-0000-000000000000"
-
-	cases := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodPost, "/api/admin/albums"},
-		{http.MethodPatch, "/api/admin/albums/" + unknownID},
-		{http.MethodDelete, "/api/admin/albums/" + unknownID},
-		{http.MethodPost, "/api/admin/tracks"},
-		{http.MethodPatch, "/api/admin/tracks/" + unknownID},
-		{http.MethodDelete, "/api/admin/tracks/" + unknownID},
-	}
-	for _, tc := range cases {
-		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, tc.path, nil)
-			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, req)
-			if rec.Code != http.StatusUnauthorized {
-				t.Errorf("%s %s (no token) status = %d, want 401", tc.method, tc.path, rec.Code)
-			}
-		})
+		t.Errorf("GET /api/music status = %d, want 200", rec.Code)
 	}
 }
 
 func TestHandler_CreateTrack_RejectsNonMP3(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "Bad Upload"}, []byte("this is not an mp3 at all"))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -235,13 +167,12 @@ func TestHandler_CreateTrack_RejectsNonMP3(t *testing.T) {
 }
 
 func TestHandler_CreateTrack_RejectsOversizedBody(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	oversized := bytes.Repeat([]byte{0}, 56<<20) // over the 55 MiB cap
 	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "Too Big"}, oversized)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -251,7 +182,7 @@ func TestHandler_CreateTrack_RejectsOversizedBody(t *testing.T) {
 }
 
 func TestHandler_CreateTrack_Success(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartTrackUploadBody(t, map[string]string{
 		"title":       "A Real Track",
 		"description": "a description",
@@ -259,7 +190,6 @@ func TestHandler_CreateTrack_Success(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -283,7 +213,7 @@ func TestHandler_CreateTrack_Success(t *testing.T) {
 }
 
 func TestHandler_CreateAlbum_Success(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartAlbumBody(t, map[string]string{
 		"title":       "A Real Album",
 		"description": "a description",
@@ -291,7 +221,6 @@ func TestHandler_CreateAlbum_Success(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/albums", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -309,7 +238,7 @@ func TestHandler_CreateAlbum_Success(t *testing.T) {
 }
 
 func TestHandler_CreateAlbum_RejectsInvalidMetadataJSON(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartAlbumBody(t, map[string]string{
 		"title":    "Bad Metadata Album",
 		"metadata": "not valid json",
@@ -317,7 +246,6 @@ func TestHandler_CreateAlbum_RejectsInvalidMetadataJSON(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/albums", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -327,12 +255,11 @@ func TestHandler_CreateAlbum_RejectsInvalidMetadataJSON(t *testing.T) {
 }
 
 func TestHandler_ListMusic_GroupsTrackUnderItsAlbum(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 
 	albumBody, albumCT := multipartAlbumBody(t, map[string]string{"title": "Grouping Album"})
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/albums", albumBody)
 	req.Header.Set("Content-Type", albumCT)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -349,7 +276,6 @@ func TestHandler_ListMusic_GroupsTrackUnderItsAlbum(t *testing.T) {
 	}, testMP3())
 	req = httptest.NewRequest(http.MethodPost, "/api/admin/tracks", trackBody)
 	req.Header.Set("Content-Type", trackCT)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -387,12 +313,11 @@ func TestHandler_ListMusic_GroupsTrackUnderItsAlbum(t *testing.T) {
 }
 
 func TestHandler_DeleteTrack_RemovesRowEvenIfStorageCleanupFails(t *testing.T) {
-	mux, token := newFailingStorageTestServer(t)
+	mux := newFailingStorageTestServer(t)
 	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "Will Be Deleted"}, testMP3())
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -404,7 +329,6 @@ func TestHandler_DeleteTrack_RemovesRowEvenIfStorageCleanupFails(t *testing.T) {
 	}
 
 	delReq := httptest.NewRequest(http.MethodDelete, "/api/admin/tracks/"+created.ID, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
 	delRec := httptest.NewRecorder()
 	mux.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusNoContent {
@@ -426,12 +350,11 @@ func TestHandler_DeleteTrack_RemovesRowEvenIfStorageCleanupFails(t *testing.T) {
 }
 
 func TestHandler_DeleteAlbum_DetachesTracksToSingles(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 
 	albumBody, albumCT := multipartAlbumBody(t, map[string]string{"title": "Album To Delete"})
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/albums", albumBody)
 	req.Header.Set("Content-Type", albumCT)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	var album Album
@@ -445,7 +368,6 @@ func TestHandler_DeleteAlbum_DetachesTracksToSingles(t *testing.T) {
 	}, testMP3())
 	req = httptest.NewRequest(http.MethodPost, "/api/admin/tracks", trackBody)
 	req.Header.Set("Content-Type", trackCT)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	var track Track
@@ -454,7 +376,6 @@ func TestHandler_DeleteAlbum_DetachesTracksToSingles(t *testing.T) {
 	}
 
 	delReq := httptest.NewRequest(http.MethodDelete, "/api/admin/albums/"+album.ID, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
 	delRec := httptest.NewRecorder()
 	mux.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusNoContent {
@@ -480,14 +401,13 @@ func TestHandler_DeleteAlbum_DetachesTracksToSingles(t *testing.T) {
 }
 
 func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	unknownID := "00000000-0000-0000-0000-000000000000"
 
 	newTitle := "won't apply"
 	patchBody, _ := json.Marshal(TrackUpdate{Title: &newTitle})
 	patchReq := httptest.NewRequest(http.MethodPatch, "/api/admin/tracks/"+unknownID, bytes.NewReader(patchBody))
 	patchReq.Header.Set("Content-Type", "application/json")
-	patchReq.Header.Set("Authorization", "Bearer "+token)
 	patchRec := httptest.NewRecorder()
 	mux.ServeHTTP(patchRec, patchReq)
 	if patchRec.Code != http.StatusNotFound {
@@ -495,7 +415,6 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 	}
 
 	delReq := httptest.NewRequest(http.MethodDelete, "/api/admin/tracks/"+unknownID, nil)
-	delReq.Header.Set("Authorization", "Bearer "+token)
 	delRec := httptest.NewRecorder()
 	mux.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusNotFound {
@@ -505,7 +424,6 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 	albumPatchBody, _ := json.Marshal(AlbumUpdate{Title: &newTitle})
 	albumPatchReq := httptest.NewRequest(http.MethodPatch, "/api/admin/albums/"+unknownID, bytes.NewReader(albumPatchBody))
 	albumPatchReq.Header.Set("Content-Type", "application/json")
-	albumPatchReq.Header.Set("Authorization", "Bearer "+token)
 	albumPatchRec := httptest.NewRecorder()
 	mux.ServeHTTP(albumPatchRec, albumPatchReq)
 	if albumPatchRec.Code != http.StatusNotFound {
@@ -513,7 +431,6 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 	}
 
 	albumDelReq := httptest.NewRequest(http.MethodDelete, "/api/admin/albums/"+unknownID, nil)
-	albumDelReq.Header.Set("Authorization", "Bearer "+token)
 	albumDelRec := httptest.NewRecorder()
 	mux.ServeHTTP(albumDelRec, albumDelReq)
 	if albumDelRec.Code != http.StatusNotFound {
@@ -524,7 +441,7 @@ func TestHandler_UnknownID_Returns404NotFor500(t *testing.T) {
 // createAlbumWithCover builds the create request directly (rather than via
 // multipartAlbumBody, which only handles text fields) so it includes a real
 // cover file.
-func createAlbumWithCover(t *testing.T, mux *http.ServeMux, token string) Album {
+func createAlbumWithCover(t *testing.T, mux *http.ServeMux) Album {
 	t.Helper()
 	buf := new(bytes.Buffer)
 	w := multipart.NewWriter(buf)
@@ -541,7 +458,6 @@ func createAlbumWithCover(t *testing.T, mux *http.ServeMux, token string) Album 
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/albums", buf)
 	req.Header.Set("Content-Type", w.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -558,7 +474,7 @@ func createAlbumWithCover(t *testing.T, mux *http.ServeMux, token string) Album 
 }
 
 // createTrackWithCover is createAlbumWithCover's track equivalent.
-func createTrackWithCover(t *testing.T, mux *http.ServeMux, token string) Track {
+func createTrackWithCover(t *testing.T, mux *http.ServeMux) Track {
 	t.Helper()
 	buf := new(bytes.Buffer)
 	w := multipart.NewWriter(buf)
@@ -582,7 +498,6 @@ func createTrackWithCover(t *testing.T, mux *http.ServeMux, token string) Track 
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", buf)
 	req.Header.Set("Content-Type", w.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
@@ -599,11 +514,10 @@ func createTrackWithCover(t *testing.T, mux *http.ServeMux, token string) Track 
 }
 
 func TestHandler_UpdateAlbumCover_AddsCoverToAlbumThatHadNone(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartAlbumBody(t, map[string]string{"title": "No Cover Yet"})
 	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/albums", body)
 	createReq.Header.Set("Content-Type", contentType)
-	createReq.Header.Set("Authorization", "Bearer "+token)
 	createRec := httptest.NewRecorder()
 	mux.ServeHTTP(createRec, createReq)
 	var created Album
@@ -617,7 +531,6 @@ func TestHandler_UpdateAlbumCover_AddsCoverToAlbumThatHadNone(t *testing.T) {
 	coverBody, coverContentType := multipartCoverBody(t, testJPEG(t))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/albums/"+created.ID+"/cover", coverBody)
 	req.Header.Set("Content-Type", coverContentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -634,14 +547,13 @@ func TestHandler_UpdateAlbumCover_AddsCoverToAlbumThatHadNone(t *testing.T) {
 }
 
 func TestHandler_UpdateAlbumCover_ReplacesExistingCoverAndCleansUpOld(t *testing.T) {
-	mux, token := newFailingStorageTestServer(t)
-	created := createAlbumWithCover(t, mux, token)
+	mux := newFailingStorageTestServer(t)
+	created := createAlbumWithCover(t, mux)
 	firstCoverURL := *created.CoverURL
 
 	body, contentType := multipartCoverBody(t, testJPEG(t))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/albums/"+created.ID+"/cover", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -660,11 +572,10 @@ func TestHandler_UpdateAlbumCover_ReplacesExistingCoverAndCleansUpOld(t *testing
 }
 
 func TestHandler_UpdateAlbumCover_RejectsNonImage(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartAlbumBody(t, map[string]string{"title": "Bad Cover Target"})
 	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/albums", body)
 	createReq.Header.Set("Content-Type", contentType)
-	createReq.Header.Set("Authorization", "Bearer "+token)
 	createRec := httptest.NewRecorder()
 	mux.ServeHTTP(createRec, createReq)
 	var created Album
@@ -675,7 +586,6 @@ func TestHandler_UpdateAlbumCover_RejectsNonImage(t *testing.T) {
 	coverBody, coverContentType := multipartCoverBody(t, []byte("not an image"))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/albums/"+created.ID+"/cover", coverBody)
 	req.Header.Set("Content-Type", coverContentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -685,13 +595,12 @@ func TestHandler_UpdateAlbumCover_RejectsNonImage(t *testing.T) {
 }
 
 func TestHandler_UpdateAlbumCover_UnknownIDReturns404(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	unknownID := "00000000-0000-0000-0000-000000000000"
 
 	body, contentType := multipartCoverBody(t, testJPEG(t))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/albums/"+unknownID+"/cover", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -701,11 +610,10 @@ func TestHandler_UpdateAlbumCover_UnknownIDReturns404(t *testing.T) {
 }
 
 func TestHandler_UpdateTrackCover_AddsCoverToTrackThatHadNone(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "No Cover Yet"}, testMP3())
 	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
 	createReq.Header.Set("Content-Type", contentType)
-	createReq.Header.Set("Authorization", "Bearer "+token)
 	createRec := httptest.NewRecorder()
 	mux.ServeHTTP(createRec, createReq)
 	var created Track
@@ -719,7 +627,6 @@ func TestHandler_UpdateTrackCover_AddsCoverToTrackThatHadNone(t *testing.T) {
 	coverBody, coverContentType := multipartCoverBody(t, testJPEG(t))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/tracks/"+created.ID+"/cover", coverBody)
 	req.Header.Set("Content-Type", coverContentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -736,14 +643,13 @@ func TestHandler_UpdateTrackCover_AddsCoverToTrackThatHadNone(t *testing.T) {
 }
 
 func TestHandler_UpdateTrackCover_ReplacesExistingCoverAndCleansUpOld(t *testing.T) {
-	mux, token := newFailingStorageTestServer(t)
-	created := createTrackWithCover(t, mux, token)
+	mux := newFailingStorageTestServer(t)
+	created := createTrackWithCover(t, mux)
 	firstCoverURL := *created.CoverURL
 
 	body, contentType := multipartCoverBody(t, testJPEG(t))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/tracks/"+created.ID+"/cover", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -760,11 +666,10 @@ func TestHandler_UpdateTrackCover_ReplacesExistingCoverAndCleansUpOld(t *testing
 }
 
 func TestHandler_UpdateTrackCover_RejectsNonImage(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "Bad Cover Target"}, testMP3())
 	createReq := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
 	createReq.Header.Set("Content-Type", contentType)
-	createReq.Header.Set("Authorization", "Bearer "+token)
 	createRec := httptest.NewRecorder()
 	mux.ServeHTTP(createRec, createReq)
 	var created Track
@@ -775,7 +680,6 @@ func TestHandler_UpdateTrackCover_RejectsNonImage(t *testing.T) {
 	coverBody, coverContentType := multipartCoverBody(t, []byte("not an image"))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/tracks/"+created.ID+"/cover", coverBody)
 	req.Header.Set("Content-Type", coverContentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -785,36 +689,16 @@ func TestHandler_UpdateTrackCover_RejectsNonImage(t *testing.T) {
 }
 
 func TestHandler_UpdateTrackCover_UnknownIDReturns404(t *testing.T) {
-	mux, token := newTestServer(t)
+	mux := newTestServer(t)
 	unknownID := "00000000-0000-0000-0000-000000000000"
 
 	body, contentType := multipartCoverBody(t, testJPEG(t))
 	req := httptest.NewRequest(http.MethodPatch, "/api/admin/tracks/"+unknownID+"/cover", body)
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
-	}
-}
-
-func TestHandler_UpdateCover_RequiresAuth(t *testing.T) {
-	mux, _ := newTestServer(t)
-	unknownID := "00000000-0000-0000-0000-000000000000"
-	body, contentType := multipartCoverBody(t, testJPEG(t))
-
-	for _, path := range []string{
-		"/api/admin/albums/" + unknownID + "/cover",
-		"/api/admin/tracks/" + unknownID + "/cover",
-	} {
-		req := httptest.NewRequest(http.MethodPatch, path, bytes.NewReader(body.Bytes()))
-		req.Header.Set("Content-Type", contentType)
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("%s status = %d, want 401", path, rec.Code)
-		}
 	}
 }
