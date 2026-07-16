@@ -170,15 +170,29 @@ func (r *Repo) Update(ctx context.Context, id string, u PostUpdate) (*Post, erro
 
 // Publish sets status to published. published_at is only set the first
 // time — an unpublish/republish cycle keeps the original publish date.
+// An empty excerpt is derived from the content and stored at publish, so
+// published rows always carry a real excerpt and list readers (the public
+// site queries PostgREST directly) never need content_markdown just to
+// build one. Re-publishing an already-published post derives too, which
+// doubles as the backfill path for rows published before this existed.
 func (r *Repo) Publish(ctx context.Context, id string) (*Post, error) {
+	p, err := r.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	excerpt := p.Excerpt
+	if excerpt == "" {
+		excerpt = deriveExcerpt(p.ContentMarkdown, excerptLen)
+	}
 	return scanPost(r.db.QueryRow(ctx,
 		`update posts set
 		   status = 'published',
+		   excerpt = $2,
 		   published_at = coalesce(published_at, now()),
 		   updated_at = now()
 		 where id = $1
 		 returning `+postCols,
-		id))
+		id, excerpt))
 }
 
 // Unpublish sets status back to draft without touching published_at.

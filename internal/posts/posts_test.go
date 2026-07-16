@@ -264,3 +264,36 @@ func TestRepo_Delete_RemovesRowAndReturnsCoverPath(t *testing.T) {
 		t.Errorf("Get() after Delete() error = %v, want pgx.ErrNoRows", err)
 	}
 }
+
+func TestRepo_Publish_DerivesEmptyExcerpt(t *testing.T) {
+	repo := NewRepo(testutil.OpenTestTx(t))
+	created, err := repo.Insert(context.Background(), &Post{
+		Title:           "No Excerpt Yet",
+		ContentMarkdown: "# Heading\n\nBody text for the excerpt.",
+	})
+	if err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	published, err := repo.Publish(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	want := "Heading Body text for the excerpt."
+	if published.Excerpt != want {
+		t.Errorf("Excerpt = %q, want %q (derived from content)", published.Excerpt, want)
+	}
+}
+
+func TestRepo_Publish_KeepsAuthoredExcerpt(t *testing.T) {
+	repo := NewRepo(testutil.OpenTestTx(t))
+	created := insertTestPost(t, repo, "Authored Excerpt")
+
+	published, err := repo.Publish(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if published.Excerpt != "an excerpt" {
+		t.Errorf("Excerpt = %q, want %q (authored excerpt untouched)", published.Excerpt, "an excerpt")
+	}
+}
