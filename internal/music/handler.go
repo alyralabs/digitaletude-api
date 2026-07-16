@@ -24,8 +24,13 @@ import (
 )
 
 const (
-	maxTrackUploadBytes = 55 << 20 // 50 MB audio + room for an optional cover
-	maxAlbumUploadBytes = 15 << 20 // cover only, same cap as photos
+	maxTrackUploadBytes = 105 << 20 // 50 MB audio + a 50 MB cover in one multipart request
+	maxAlbumUploadBytes = 50 << 20  // cover only, same cap as photos
+
+	// Cover art never renders larger than the album image on the music page
+	// (160 CSS px, 320 device px at 2x) — a 320 px thumbnail serves every
+	// display, at roughly a tenth the bytes of the 800 px photo default.
+	coverThumbWidth = 320
 )
 
 type Handler struct {
@@ -237,7 +242,7 @@ func (h *Handler) createTrack(w http.ResponseWriter, r *http.Request) {
 			httpserver.Internal(w, err)
 			return
 		}
-		proc, err := imageproc.Process(raw)
+		proc, err := imageproc.ProcessAt(raw, coverThumbWidth)
 		if err != nil {
 			h.cleanupObjects(audioPath)
 			httpserver.Err(w, http.StatusUnprocessableEntity, "invalid_image", "could not process cover image")
@@ -293,7 +298,7 @@ func (h *Handler) updateTrack(w http.ResponseWriter, r *http.Request) {
 }
 
 // updateTrackCover replaces a track's cover art — add it where there wasn't
-// one, or swap an existing one. Cover-only upload, same 15 MB cap as an
+// one, or swap an existing one. Cover-only upload, same 50 MB cap as an
 // album cover (the audio file itself is untouched).
 // receiveCover is the shared front half of the two cover-replacement
 // handlers: it validates the multipart "cover" upload, thumbnails it, and
@@ -320,7 +325,7 @@ func (h *Handler) receiveCover(w http.ResponseWriter, r *http.Request) (coverPat
 		httpserver.Internal(w, err)
 		return "", false
 	}
-	proc, err := imageproc.Process(raw)
+	proc, err := imageproc.ProcessAt(raw, coverThumbWidth)
 	if errors.Is(err, imageproc.ErrUnsupportedType) {
 		httpserver.Err(w, http.StatusUnsupportedMediaType, "unsupported_type", "only JPEG and PNG are accepted")
 		return "", false
@@ -404,7 +409,7 @@ func (h *Handler) createAlbum(w http.ResponseWriter, r *http.Request) {
 			httpserver.Internal(w, err)
 			return
 		}
-		proc, err := imageproc.Process(raw)
+		proc, err := imageproc.ProcessAt(raw, coverThumbWidth)
 		if err != nil {
 			httpserver.Err(w, http.StatusUnprocessableEntity, "invalid_image", "could not process cover image")
 			return

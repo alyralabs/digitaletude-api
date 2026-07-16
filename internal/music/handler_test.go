@@ -168,7 +168,7 @@ func TestHandler_CreateTrack_RejectsNonMP3(t *testing.T) {
 
 func TestHandler_CreateTrack_RejectsOversizedBody(t *testing.T) {
 	mux := newTestServer(t)
-	oversized := bytes.Repeat([]byte{0}, 56<<20) // over the 55 MiB cap
+	oversized := bytes.Repeat([]byte{0}, 106<<20) // over the 105 MiB cap
 	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "Too Big"}, oversized)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)

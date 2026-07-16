@@ -19,7 +19,11 @@ import (
 	"github.com/alyralabs/digitaletude-api/internal/storage"
 )
 
-const maxUploadBytes = 15 << 20 // 15 MB request cap
+// Matches Supabase's free-plan global file size limit (50 MB) — no point
+// accepting a request the storage upload would then reject. High-res camera
+// JPEGs (45–61 MP) routinely run 25–60 MB, so anything lower bounces real
+// photos.
+const maxUploadBytes = 50 << 20
 
 type Handler struct {
 	repo    *Repo
@@ -78,7 +82,7 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	if err := r.ParseMultipartForm(4 << 20); err != nil {
-		httpserver.Err(w, http.StatusRequestEntityTooLarge, "too_large", "upload exceeds 15 MB")
+		httpserver.Err(w, http.StatusRequestEntityTooLarge, "too_large", "upload exceeds 50 MB")
 		return
 	}
 

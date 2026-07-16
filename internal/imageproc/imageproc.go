@@ -19,7 +19,9 @@ import (
 )
 
 const (
-	maxPixels    = 40_000_000
+	// Above today's highest-resolution stills bodies (61 MP) with headroom,
+	// while still rejecting decompression bombs before full decode.
+	maxPixels    = 80_000_000
 	thumbWidth   = 800
 	thumbQuality = 80
 )
@@ -57,7 +59,9 @@ func (e *Exif) isEmpty() bool {
 	return e.Camera == "" && e.Aperture == "" && e.ShutterSpeed == "" && e.ISO == "" && e.FocalLength == ""
 }
 
-// Process validates raw upload bytes and produces the thumbnail.
+// Process validates raw upload bytes and produces the thumbnail at the
+// default 800 px width — right for images that render large (photo grid,
+// blog covers).
 //
 //   - Content type comes from magic bytes (http.DetectContentType), never the
 //     client's header.
@@ -67,6 +71,12 @@ func (e *Exif) isEmpty() bool {
 //     applied before thumbnailing (phone portraits would otherwise come out
 //     sideways). PNGs have no EXIF.
 func Process(raw []byte) (*Processed, error) {
+	return ProcessAt(raw, thumbWidth)
+}
+
+// ProcessAt is Process with a caller-chosen thumbnail width, for images
+// whose largest rendered size is known to be small (music cover art).
+func ProcessAt(raw []byte, maxWidth int) (*Processed, error) {
 	mime := http.DetectContentType(raw)
 	var ext string
 	switch mime {
@@ -104,8 +114,8 @@ func Process(raw []byte) (*Processed, error) {
 	width, height := bounds.Dx(), bounds.Dy()
 
 	thumb := img
-	if width > thumbWidth {
-		thumb = imaging.Resize(img, thumbWidth, 0, imaging.Lanczos)
+	if width > maxWidth {
+		thumb = imaging.Resize(img, maxWidth, 0, imaging.Lanczos)
 	}
 	var buf bytes.Buffer
 	if err := imaging.Encode(&buf, thumb, imaging.JPEG, imaging.JPEGQuality(thumbQuality)); err != nil {

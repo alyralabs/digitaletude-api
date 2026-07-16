@@ -180,7 +180,7 @@ func TestHandler_Create_RejectsNonImage(t *testing.T) {
 
 func TestHandler_Create_RejectsOversizedBody(t *testing.T) {
 	mux := newTestServer(t)
-	oversized := bytes.Repeat([]byte{0}, 16<<20) // 16 MiB, over the 15 MiB cap
+	oversized := bytes.Repeat([]byte{0}, 51<<20) // 51 MiB, over the 50 MiB cap
 	body, contentType := multipartUploadBody(t, "Too Big", "", oversized)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/photos", body)

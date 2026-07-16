@@ -236,7 +236,7 @@ func TestProcess_RejectsUnsupportedType(t *testing.T) {
 }
 
 func TestProcess_RejectsPixelBomb(t *testing.T) {
-	// 10000x10000 = 100,000,000 pixels, well over the 40MP cap.
+	// 10000x10000 = 100,000,000 pixels, over the 80MP cap.
 	_, err := Process(bombPNG(10000, 10000))
 	if err == nil {
 		t.Fatal("Process() succeeded on a pixel-bomb PNG, want an error")
@@ -303,14 +303,28 @@ func TestProcess_ThumbnailNotUpscaledWhenNarrow(t *testing.T) {
 	}
 }
 
+func TestProcessAt_UsesCallerWidth(t *testing.T) {
+	proc, err := ProcessAt(encodeJPEG(t, 1600, 800), 320)
+	if err != nil {
+		t.Fatalf("ProcessAt() error = %v", err)
+	}
+	if got := decodedWidth(t, proc.Thumbnail); got != 320 {
+		t.Errorf("thumbnail width = %d, want 320", got)
+	}
+	// Reported dimensions stay those of the original, not the thumbnail.
+	if proc.Width != 1600 || proc.Height != 800 {
+		t.Errorf("Width×Height = %d×%d, want 1600×800", proc.Width, proc.Height)
+	}
+}
+
 func TestProcess_ExtractsExifCameraSettings(t *testing.T) {
 	raw := exifJPEGWithTags(t, 100, 80, []ifdEntry{
-		{tag: 0x010F, typ: 2, count: 6, value: asciiValue("Canon")},          // Make
+		{tag: 0x010F, typ: 2, count: 6, value: asciiValue("Canon")},         // Make
 		{tag: 0x0110, typ: 2, count: 13, value: asciiValue("Canon EOS R5")}, // Model
-		{tag: 0x829A, typ: 5, count: 1, value: rationalValue(1, 250)},      // ExposureTime
-		{tag: 0x829D, typ: 5, count: 1, value: rationalValue(28, 10)},      // FNumber
-		{tag: 0x8827, typ: 3, count: 1, value: shortValue(400)},            // ISOSpeedRatings
-		{tag: 0x920A, typ: 5, count: 1, value: rationalValue(50, 1)},       // FocalLength
+		{tag: 0x829A, typ: 5, count: 1, value: rationalValue(1, 250)},       // ExposureTime
+		{tag: 0x829D, typ: 5, count: 1, value: rationalValue(28, 10)},       // FNumber
+		{tag: 0x8827, typ: 3, count: 1, value: shortValue(400)},             // ISOSpeedRatings
+		{tag: 0x920A, typ: 5, count: 1, value: rationalValue(50, 1)},        // FocalLength
 	})
 
 	proc, err := Process(raw)

@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	maxPostUploadBytes = 15 << 20 // cover only, same cap as photos/albums
+	maxPostUploadBytes = 50 << 20 // cover only, same cap as photos/albums
 	excerptLen         = 200
 )
 
