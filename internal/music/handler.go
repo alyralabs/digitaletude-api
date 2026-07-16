@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dhowden/tag"
@@ -24,7 +26,7 @@ import (
 )
 
 const (
-	maxTrackUploadBytes = 105 << 20 // 50 MB audio + a 50 MB cover in one multipart request
+	maxTrackUploadBytes = 550 << 20 // 500 MB audio (any format, pre-transcode) + a 50 MB cover in one multipart request
 	maxAlbumUploadBytes = 50 << 20  // cover only, same cap as photos
 
 	// Cover art never renders larger than the album image on the music page
@@ -136,6 +138,42 @@ func isMP3(head []byte) bool {
 	return len(head) >= 2 && head[0] == 0xFF && head[1]&0xE0 == 0xE0
 }
 
+// transcodeToMP3 shells out to ffmpeg to re-encode any audio input as
+// 192 kbps MP3, returning an open handle on a fresh temp file the caller
+// must close and remove. Source tags carry into the output's ID3 header;
+// embedded cover-art streams are dropped (-vn) — covers travel separately
+// in this API. A missing ffmpeg binary surfaces as exec.ErrNotFound;
+// any other failure means ffmpeg couldn't decode the input.
+func transcodeToMP3(ctx context.Context, srcPath string) (*os.File, error) {
+	out, err := os.CreateTemp("", "track-transcoded-*.mp3")
+	if err != nil {
+		return nil, err
+	}
+	out.Close()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-y", "-i", srcPath,
+		"-vn",
+		"-c:a", "libmp3lame", "-b:a", "192k",
+		"-f", "mp3",
+		out.Name(),
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		os.Remove(out.Name())
+		lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+		return nil, fmt.Errorf("ffmpeg: %w: %s", err, lines[len(lines)-1])
+	}
+
+	f, err := os.Open(out.Name())
+	if err != nil {
+		os.Remove(out.Name())
+		return nil, err
+	}
+	return f, nil
+}
+
 // trackDuration walks MPEG frames summing their durations (correct under VBR,
 // unlike bitrate arithmetic). Any parse failure returns whatever was
 // accumulated so far, or nil if nothing decoded — duration is never allowed
@@ -178,7 +216,7 @@ func (h *Handler) createTrack(w http.ResponseWriter, r *http.Request) {
 	// Spool to disk: Supabase's upload endpoint needs a known Content-Length,
 	// and the file has to be read twice (tags/duration, then upload) —
 	// spooling keeps memory flat and lets us seek.
-	tmp, err := os.CreateTemp("", "track-*.mp3")
+	tmp, err := os.CreateTemp("", "track-upload-*")
 	if err != nil {
 		httpserver.Internal(w, err)
 		return
@@ -191,13 +229,30 @@ func (h *Handler) createTrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// audio is what actually gets stored: the upload itself when it's
+	// already MP3 (re-encoding MP3 to MP3 is pure generation loss),
+	// otherwise a 192 kbps MP3 transcode of it.
+	audio := tmp
 	head := make([]byte, 4)
 	n, _ := tmp.ReadAt(head, 0)
 	if !isMP3(head[:n]) {
-		httpserver.Err(w, http.StatusUnsupportedMediaType, "unsupported_type", "only MP3 audio is accepted")
-		return
+		transcoded, err := transcodeToMP3(r.Context(), tmp.Name())
+		if errors.Is(err, exec.ErrNotFound) {
+			httpserver.Internal(w, err)
+			return
+		}
+		if err != nil {
+			httpserver.Err(w, http.StatusUnsupportedMediaType, "unsupported_type", "could not decode audio — upload MP3, M4A, WAV, FLAC, or similar")
+			return
+		}
+		defer os.Remove(transcoded.Name())
+		defer transcoded.Close()
+		audio = transcoded
 	}
 
+	// Tags are read from the original upload, not the transcode — dhowden/tag
+	// parses MP4/FLAC/OGG containers natively, so the source is the richer
+	// (and always available) side.
 	title := r.FormValue("title")
 	if title == "" {
 		if _, err := tmp.Seek(0, io.SeekStart); err == nil {
@@ -207,7 +262,7 @@ func (h *Handler) createTrack(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	duration := trackDuration(tmp)
+	duration := trackDuration(audio)
 
 	var albumID *string
 	if v := r.FormValue("album_id"); v != "" {
@@ -224,11 +279,11 @@ func (h *Handler) createTrack(w http.ResponseWriter, r *http.Request) {
 	id := uuid.NewString()
 	audioPath := fmt.Sprintf("tracks/%s.mp3", id)
 
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+	if _, err := audio.Seek(0, io.SeekStart); err != nil {
 		httpserver.Internal(w, err)
 		return
 	}
-	if err := h.storage.Upload(ctx, Bucket, audioPath, "audio/mpeg", tmp); err != nil {
+	if err := h.storage.Upload(ctx, Bucket, audioPath, "audio/mpeg", audio); err != nil {
 		httpserver.Internal(w, err)
 		return
 	}

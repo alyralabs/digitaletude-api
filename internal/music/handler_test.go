@@ -2,13 +2,17 @@ package music
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/alyralabs/digitaletude-api/internal/storage"
@@ -60,6 +64,43 @@ func newFailingStorageTestServer(t *testing.T) *http.ServeMux {
 	h.RegisterPublic(mux)
 	h.RegisterAdmin(mux)
 	return mux
+}
+
+// requireFFmpeg skips tests that exercise the transcode path on machines
+// without ffmpeg, mirroring how DB-backed tests skip without
+// TEST_DATABASE_URL.
+func requireFFmpeg(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed — skipping transcode test")
+	}
+}
+
+// testWAV returns a real, decodable WAV: a 44-byte PCM header plus two
+// seconds of 8 kHz mono 16-bit silence. Unlike testMP3, the transcode path
+// actually decodes it (via ffmpeg), so a magic-byte-only stub won't do.
+func testWAV(t *testing.T) []byte {
+	t.Helper()
+	const (
+		sampleRate = 8000
+		seconds    = 2
+		dataLen    = sampleRate * seconds * 2 // 16-bit mono
+	)
+	var buf bytes.Buffer
+	buf.WriteString("RIFF")
+	binary.Write(&buf, binary.LittleEndian, uint32(36+dataLen))
+	buf.WriteString("WAVEfmt ")
+	binary.Write(&buf, binary.LittleEndian, uint32(16))           // fmt chunk size
+	binary.Write(&buf, binary.LittleEndian, uint16(1))            // PCM
+	binary.Write(&buf, binary.LittleEndian, uint16(1))            // mono
+	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))   // sample rate
+	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*2)) // byte rate
+	binary.Write(&buf, binary.LittleEndian, uint16(2))            // block align
+	binary.Write(&buf, binary.LittleEndian, uint16(16))           // bits per sample
+	buf.WriteString("data")
+	binary.Write(&buf, binary.LittleEndian, uint32(dataLen))
+	buf.Write(make([]byte, dataLen))
+	return buf.Bytes()
 }
 
 // testMP3 returns bytes that pass isMP3's ID3v2-header check. Not a decodable
@@ -152,9 +193,12 @@ func TestHandler_PublicRoute(t *testing.T) {
 	}
 }
 
-func TestHandler_CreateTrack_RejectsNonMP3(t *testing.T) {
+// Undecodable input now reaches ffmpeg (nothing else rejects it), so this
+// doubles as the "garbage in, clean 415 out" test for the transcode path.
+func TestHandler_CreateTrack_RejectsUndecodableAudio(t *testing.T) {
+	requireFFmpeg(t)
 	mux := newTestServer(t)
-	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "Bad Upload"}, []byte("this is not an mp3 at all"))
+	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "Bad Upload"}, []byte("this is not audio at all"))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
 	req.Header.Set("Content-Type", contentType)
@@ -166,13 +210,54 @@ func TestHandler_CreateTrack_RejectsNonMP3(t *testing.T) {
 	}
 }
 
-func TestHandler_CreateTrack_RejectsOversizedBody(t *testing.T) {
+func TestHandler_CreateTrack_TranscodesWAV(t *testing.T) {
+	requireFFmpeg(t)
 	mux := newTestServer(t)
-	oversized := bytes.Repeat([]byte{0}, 106<<20) // over the 105 MiB cap
-	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "Too Big"}, oversized)
+	body, contentType := multipartTrackUploadBody(t, map[string]string{"title": "From WAV"}, testWAV(t))
 
 	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
 	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body: %s", rec.Code, rec.Body.String())
+	}
+
+	var got Track
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	// A real duration proves the stored file is a decodable MPEG stream —
+	// trackDuration runs on the transcode output, not the WAV.
+	if got.DurationSeconds == nil || *got.DurationSeconds < 1 {
+		t.Errorf("DurationSeconds = %v, want ~2s from the transcoded MP3", got.DurationSeconds)
+	}
+}
+
+// zeros streams an endless run of zero bytes so the oversize test doesn't
+// have to hold a >550 MB buffer in memory.
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}
+
+func TestHandler_CreateTrack_RejectsOversizedBody(t *testing.T) {
+	mux := newTestServer(t)
+	const boundary = "oversize-test-boundary"
+	body := io.MultiReader(
+		strings.NewReader("--"+boundary+"\r\n"+
+			`Content-Disposition: form-data; name="file"; filename="big.wav"`+"\r\n\r\n"),
+		io.LimitReader(zeros{}, 551<<20), // over the 550 MiB cap
+		strings.NewReader("\r\n--"+boundary+"--\r\n"),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/tracks", body)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
